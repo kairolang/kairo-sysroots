@@ -1,0 +1,1 @@
+ "/usr/bin/ld" "--sysroot=staging/x86_64-linux-musl" "--hash-style=gnu" "--eh-frame-hdr" "-m" "elf_x86_64" "-static" "-o" "a.out" "staging/x86_64-linux-musl/lib/crt1.o" "staging/x86_64-linux-musl/lib/crti.o" "crtbeginT.o" "-Lstaging/x86_64-linux-musl/lib" "/tmp/t-7bb842.o" "--start-group" "-lgcc" "-lgcc_eh" "-lc" "--end-group" "crtend.o" "staging/x86_64-linux-musl/lib/crtn.o"
