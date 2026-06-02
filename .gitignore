@@ -1,0 +1,12 @@
+# build workspace regenerable via curate/ scripts
+/extract/
+/staging/
+/alpine-pull/
+
+# release assets live on GitHub Releases, never in git
+*.tar.xz
+*.tar.gz
+*.txz
+
+# local tooling
+.claude/
