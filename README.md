@@ -45,9 +45,9 @@ A sysroot here is a self-contained directory holding a target's C library header
 | `aarch64-windows-gnu` | `aarch64-pc-windows-gnu` | mingw-w64 (UCRT) | yes | PE/COFF |
 | `armv7-windows-gnu` | `armv7-pc-windows-gnu` | mingw-w64 (UCRT) | yes | PE/COFF |
 | `i686-windows-gnu` | `i686-pc-windows-gnu` | mingw-w64 (UCRT) | yes | PE/COFF |
-| `x86_64-unknown-freebsd` | `x86_64-unknown-freebsd14.4` | FreeBSD 14.4 base | **no** | C interop only |
-| `aarch64-unknown-freebsd` | `aarch64-unknown-freebsd14.4` | FreeBSD 14.4 base | **no** | C interop only |
-| `x86_64-unknown-netbsd` | `x86_64-unknown-netbsd10.1` | NetBSD 10.1 base | **no** | C interop only |
+| `x86_64-unknown-freebsd` | `x86_64-unknown-freebsd14.4` | FreeBSD 14.4 base | yes | fully static |
+| `aarch64-unknown-freebsd` | `aarch64-unknown-freebsd14.4` | FreeBSD 14.4 base | yes | fully static |
+| `x86_64-unknown-netbsd` | `x86_64-unknown-netbsd10.1` | NetBSD 10.1 base | yes | fully static |
 | `wasm32-wasi` | `wasm32-unknown-wasi` | wasi-libc (wasi-sdk 33) | yes | exception-enabled (`-fwasm-exceptions`) |
 
 A binary built against the glibc 2.31 sysroots runs on any distribution with glibc 2.31 or newer (Ubuntu 20.04+, Debian 11+, RHEL 9+, Fedora 32+).
@@ -93,6 +93,7 @@ curate/                    the pipeline: one script per family, plus packaging
   fetch-*.sh               download upstream packages into extract/
   build-glibc-runtimes.sh  build libc++/libunwind/compiler-rt for the glibc targets
   build-builtins.sh        build compiler-rt builtins for linux-musl and windows-gnu
+  build-bsd-runtimes.sh    build libc++/libc++abi/libunwind + builtins for FreeBSD/NetBSD
   build-wasi-builtins.sh   build compiler-rt builtins for wasm32-wasi
   <family>.sh              stage extract/ -> staging/<sysroot>/ and write SYSROOT.toml
   decompress-debug.sh      decompress zlib debug sections (so any lld can link)
@@ -206,7 +207,7 @@ bash curate/build-builtins.sh           # compiler-rt builtins from the fork (f1
 
 **windows-gnu**: unpack `llvm-mingw-20260224-ucrt-ubuntu-22.04-x86_64.tar.xz` into `extract/mingw/`, then run `bash curate/mingw.sh` and `bash curate/build-builtins.sh`. The builtins are built from the fork rather than taken from llvm-mingw. llvm-mingw's were built by a stock clang and lack f128 and the 32-bit i128 routines.
 
-**FreeBSD / NetBSD**: unpack FreeBSD `base.txz` into `extract/<arch>-unknown-freebsd/`, and NetBSD `base.tar.xz` plus `comp.tar.xz` into `extract/x86_64-unknown-netbsd/`. Then `bash curate/freebsd.sh` or `bash curate/netbsd.sh`. The layout keeps `usr/include`, `usr/lib` and `lib` as they are, so the base system's relative symlinks still resolve.
+**FreeBSD / NetBSD**: unpack FreeBSD `base.txz` into `extract/<arch>-unknown-freebsd/`, and NetBSD `base.tar.xz` plus `comp.tar.xz` into `extract/x86_64-unknown-netbsd/`. Then run `bash curate/freebsd.sh` or `bash curate/netbsd.sh`, then `bash curate/build-bsd-runtimes.sh`. The staging scripts keep `usr/include`, `usr/lib` and `lib` as they are, so the base system's relative symlinks still resolve. `build-bsd-runtimes.sh` adds LLVM 22 libc++/libc++abi/libunwind (`libcxx/`) and compiler-rt builtins (`compiler-rt/lib/<os>/`) built from the fork. FreeBSD's base libc++ is 19, and NetBSD's base has only libstdc++.
 
 **wasm32-wasi**: unpack `wasi-sysroot-33.0+m.tar.gz` into `extract/wasm32-wasi/`, then `bash curate/wasi.sh`. Then run `bash curate/build-wasi-builtins.sh` to build the compiler-rt builtins (including bf16) from the fork's source into `compiler-rt/lib/wasm32-unknown-wasi/`.
 
@@ -318,10 +319,10 @@ gh release upload v1-llvm22 dist/* --clobber
 
 ## Known gaps
 
-- **compiler-rt builtins need the fork's clang.** Every builtins archive except FreeBSD/NetBSD (which use their own libgcc) is built from Kairo's LLVM. The fork carries `__float128` on every target, bf16 lowering for WebAssembly, and `__trunctfbf2` beyond x86_64. A stock LLVM 22 builds archives without f128 on most targets, without bf16 on wasm, and without the 32-bit i128 routines unless `-fforce-enable-int128` reaches the compiler. The build scripts check for these symbols and stop if any is missing.
+- **compiler-rt builtins need the fork's clang.** Every builtins archive is built from Kairo's LLVM. The fork carries `__float128` on every target, bf16 lowering for WebAssembly, and `__trunctfbf2` beyond x86_64. A stock LLVM 22 builds archives without f128 on most targets, without bf16 on wasm, and without the 32-bit i128 routines unless `-fforce-enable-int128` reaches the compiler. The build scripts check for these symbols and stop if any is missing.
 - **COFF has no symbol aliases.** compiler-rt defines `__eqtf2`, `__netf2`, `__lttf2`, `__gttf2` and `__cmptf2` as aliases, and they vanish on windows-msvc. `msvc.sh` adds them as forwarding functions. windows-gnu is unaffected: MinGW's COFF supports aliases through weak externals.
 - **Kairo on windows-msvc.** The sysroots link correctly through the clang driver, but Kairo can't build for them until kairo-lang:
   1. passes the MS language-mode flags on its cc1 line (`ClangBackend.k`, `_driver_target_args`),
   2. stops importing `unistd.h` unconditionally (`Lib/std/io.k`),
   3. reads `cc_defines` from `SYSROOT.toml`.
-- FreeBSD and NetBSD ship no LLVM 22 libc++ (their base libc++ would clash with Kairo's ABI), so they support C interop only.
+- **FreeBSD/NetBSD and base C++ libraries.** Kairo binaries link LLVM 22 libc++ statically. A system C++ library built against the base runtime (libc++ 19/libcxxrt on FreeBSD, libstdc++ on NetBSD) can still be linked, but C++ objects can't cross between the two runtimes. Plain C libraries are unaffected.

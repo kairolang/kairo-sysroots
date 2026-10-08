@@ -24,10 +24,11 @@
     "aarch64-unknown-freebsd": {
       "asset": "aarch64-unknown-freebsd-llvm22.tar.xz",
       "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v1-llvm22/aarch64-unknown-freebsd-llvm22.tar.xz",
-      "sha256": "d81343016a0cb6794cd21e199b5320a5c19d798401c52a7d9f066593e35a713d",
-      "size": 92529808,
+      "sha256": "2a5122193eeeaf634d84b20b44ef42338d57f73e455631130e0613cb7c252e18",
+      "size": 93437724,
       "family": "freebsd",
-      "has_libcxx": false
+      "has_libcxx": true,
+      "resource_dir": "compiler-rt"
     },
     "aarch64-windows-gnu": {
       "asset": "aarch64-windows-gnu-llvm22.tar.xz",
@@ -144,18 +145,20 @@
     "x86_64-unknown-freebsd": {
       "asset": "x86_64-unknown-freebsd-llvm22.tar.xz",
       "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v1-llvm22/x86_64-unknown-freebsd-llvm22.tar.xz",
-      "sha256": "0e5f44e8bcd417d87547fbdc915301c39bb9b2bb070a89cc598f7f2a4ce9e034",
-      "size": 99793448,
+      "sha256": "af645d0afd5d14d1d7e4e03c91d28995083f2dfe139616007041dc9c6b08f356",
+      "size": 100422904,
       "family": "freebsd",
-      "has_libcxx": false
+      "has_libcxx": true,
+      "resource_dir": "compiler-rt"
     },
     "x86_64-unknown-netbsd": {
       "asset": "x86_64-unknown-netbsd-llvm22.tar.xz",
       "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v1-llvm22/x86_64-unknown-netbsd-llvm22.tar.xz",
-      "sha256": "37063bb3f995c7fdf33f37bb594f011e1f50ea57d90eff5c28cab6a938367a80",
-      "size": 58004564,
+      "sha256": "3f148f85546b2ee07caec02ae1af56f0a4184fcfc078cf50ded984f0d16f6843",
+      "size": 58901656,
       "family": "netbsd",
-      "has_libcxx": false
+      "has_libcxx": true,
+      "resource_dir": "compiler-rt"
     },
     "x86_64-windows-gnu": {
       "asset": "x86_64-windows-gnu-llvm22.tar.xz",

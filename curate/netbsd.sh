@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Curate the NetBSD sysroot (x86_64 only). Same structure-preserving approach as
 # FreeBSD (keep usr/include + usr/lib + lib so relative symlinks resolve).
-# has_libcxx=false (C interop only). NetBSD startup object is crt0.o (not crt1.o)
-# and the default link is just -lc.
+# NetBSD startup object is crt0.o (not crt1.o). This writes a C-only
+# SYSROOT.toml; build-bsd-runtimes.sh then adds LLVM 22 libc++ (base NetBSD
+# has only GCC's libstdc++) and compiler-rt builtins (base libgcc is GCC's,
+# without f16/bf16), and rewrites the TOML.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STAGE="$ROOT/staging"

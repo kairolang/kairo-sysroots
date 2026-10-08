@@ -5,9 +5,11 @@
 # under <triple>/ keeps every relative symlink resolving correctly with zero
 # rewriting (usr/lib/foo -> ../../lib/bar  resolves to <triple>/lib/bar).
 #
-# has_libcxx=false: base libc++ is not LLVM 22 (ABI would clash with the Kairo
-# compiler). C interop only. FreeBSD links against its own libgcc (shipped in
-# usr/lib), not compiler-rt.
+# This stages the base system only and writes a C-only SYSROOT.toml
+# (has_libcxx = false, base libgcc). build-bsd-runtimes.sh then adds LLVM 22
+# libc++/libc++abi/libunwind (libcxx/) and compiler-rt builtins
+# (compiler-rt/lib/freebsd/) built from Kairo's LLVM, and rewrites the TOML.
+# Base libc++ is 19 on libcxxrt, not the libc++ 22 every other target uses.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STAGE="$ROOT/staging"

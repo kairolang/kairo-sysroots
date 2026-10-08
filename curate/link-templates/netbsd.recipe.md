@@ -1,18 +1,24 @@
-# netbsd link recipe (validated x86_64, 2026-06-01)
+# netbsd link recipe (validated x86_64, 2026-10-08)
 
-C interop only (`has_libcxx=false`). Same structure-preserving layout as FreeBSD.
-The C test link-clean.
+NetBSD 10.1 base (libc, crt objects, headers), plus LLVM 22 libc++,
+libc++abi, libunwind and compiler-rt builtins built from Kairo's LLVM by
+`build-bsd-runtimes.sh`, all linked statically. Pipeline: `netbsd.sh` ->
+`build-bsd-runtimes.sh` -> `tar-dist.sh`.
 
-## Validated command (what Kairo must reproduce)
+## Why not the base C++ runtime
 
-    clang --target=x86_64-unknown-netbsd --sysroot=<root> \
-      -nostdlibinc -fuse-ld=lld \
-      t.c -o out \
-      -L<root>/usr/lib -L<root>/lib -lc
+NetBSD's base toolchain is GCC 10: it ships libstdc++ and libsupc++, no
+libc++. Its `libgcc.a` is GCC's and has no f16 or bf16 routines.
 
-## crt + notes
-- Startup object is `crt0.o` (NOT crt1.o), then `crti.o` ... `crtn.o` shipped in
-  the sysroot `usr/lib/`.
-- Default link is just `-lc`.
-- usr/include + usr/lib + lib preserved at depth to keep relative `.so` symlinks
-  resolving.
+## Layout
+
+Same as FreeBSD: base `usr/include`, `usr/lib`, `lib` at their depth (relative
+`.so` symlinks), plus `libcxx/` and `compiler-rt/lib/netbsd/`.
+
+## Validated
+
+Startup is `crt0.o crti.o`, then `crtbeginT.o` (added by Kairo's linker for
+-static) ... `crtend.o crtn.o`. Libraries: `-lc++ -lc++abi -lunwind
+<builtins> -lm -lpthread -lc` in one group. Kairo programs (test.k,
+f128/i128/f16/bf16 arithmetic, f128 -> bf16) build and link as static NetBSD
+10.1 executables. Not run (no NetBSD host).
