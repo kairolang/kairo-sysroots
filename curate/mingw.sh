@@ -5,7 +5,8 @@
 # crtbegin/crtend ARE shipped in the mingw sysroot lib/ (unlike musl, where they
 # come from compiler-rt). compiler-rt builtins themselves still come from the
 # compiler (llvm-mingw bundles them at lib/clang/22/lib/windows, outside the
-# per-arch sysroot) -> same model as musl.
+# per-arch sysroot). Here they live in the sysroot instead: build-builtins.sh
+# builds them from Kairo's LLVM into compiler-rt/lib/windows/ (resource_dir).
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STAGE="$ROOT/staging"
@@ -29,7 +30,7 @@ sysroot       = "."
 include_dirs  = ["include/c++/v1", "include"]
 lib_dirs      = ["lib"]
 has_libcxx    = true
-static        = false
+static        = true
 crt_startup   = ["crt2.o", "crtbegin.o"]
 crt_end       = ["crtend.o"]
 libc_link     = ["-lmingw32", "-lmoldname", "-lmingwex", "-lmsvcrt", "-ladvapi32", "-lshell32", "-luser32", "-lkernel32"]
@@ -37,6 +38,7 @@ libcxx_link   = ["-lc++", "-lunwind"]
 rtlib         = "compiler-rt"
 unwindlib     = "libunwind"
 linker        = "lld"
+resource_dir  = "compiler-rt"
 cc_isolation  = ["-nostdlibinc", "-nostdinc++"]
 EOF
 }

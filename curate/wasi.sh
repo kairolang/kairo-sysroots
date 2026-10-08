@@ -10,6 +10,9 @@
 # We use the EH (exception-enabled) libc++ variant, linked with -fwasm-exceptions
 # (the wasm exception-handling proposal -> exnref). Running requires a runtime that
 # supports it (node --experimental-wasm-exnref); link-only otherwise.
+#
+# compiler-rt builtins are built afterwards by build-wasi-builtins.sh into
+# compiler-rt/lib/wasm32-unknown-wasi/ (resource_dir).
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STAGE="$ROOT/staging"
@@ -40,6 +43,8 @@ libc_link     = ["-lc"]
 libcxx_link   = ["-lc++", "-lc++abi", "-lunwind"]
 extra_cflags  = ["-fwasm-exceptions"]
 cc_isolation  = ["-nostdlibinc", "-nostdinc++"]
+rtlib         = "compiler-rt"
+resource_dir  = "compiler-rt"
 EOF
 
 test -f "$dst/lib/wasm32-wasi/eh/libc++.a"      || { echo "!! no libc++.a in staging" >&2; exit 1; }

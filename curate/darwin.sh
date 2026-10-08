@@ -7,7 +7,8 @@
 # frameworks) under -syslibroot, which the linker sets to this root.
 #
 # Ours, not Apple's: libc++/libc++abi (LLVM 22, static, hermetic) replace the
-# SDK's, and compiler-rt TF builtins fill what libSystem lacks (binary128).
+# SDK's, and compiler-rt TF + bf16 builtins fill what libSystem lacks
+# (binary128, bf16 conversions).
 #
 # Example (from the kairo-sysroots checkout, Kairo cloned at ~/kairo):
 #   OUT=~/kairo/build/arm64-apple-macosx/sysroots ./curate/darwin.sh ~/kairo arm64 x86_64 arm64e
@@ -66,6 +67,7 @@ llvm_version  = "22.1.0"
 family        = "darwin"
 sysroot       = "."
 resource_dir  = "clang"
+redistributable = false
 include_dirs  = ["usr/include/c++/v1", "usr/include"]
 lib_dirs      = ["usr/lib"]
 has_libcxx    = true
@@ -127,15 +129,33 @@ build_tf_builtins() {   # $1 = arch, $2 = min, $3 = dst
   local srcs
   srcs=$(sed -n '/^set(GENERIC_TF_SOURCES/,/)/p' "$B/CMakeLists.txt" | grep -oE '[a-z0-9_]+\.c')
   [[ -n "$srcs" ]] || { echo "!! GENERIC_TF_SOURCES not found" >&2; exit 1; }
+  # bf16 conversions: libSystem exports none, and x86_64 lowers float->bf16
+  # to a __truncsfbf2 libcall (AArch64 happens to expand it inline).
+  local bf
+  bf=$(sed -n '/^set(BF16_SOURCES/,/)/p' "$B/CMakeLists.txt" | grep -oE '[a-z0-9_]+\.c')
+  [[ -n "$bf" ]] || { echo "!! BF16_SOURCES not found" >&2; exit 1; }
+  srcs="$srcs $bf"
   rm -rf "$b"; mkdir -p "$b" "$dst/clang/lib/darwin"
+  # The TF routines round through __fe_getround / __fe_raise_inexact, which
+  # live in the arch's fp_mode.c (x86_64 shares i386's, as in compiler-rt's
+  # x86_ARCH_SOURCES). libSystem does not export them, so they ship here too.
+  case "$arch" in
+    arm64*) srcs="$srcs aarch64/fp_mode.c" ;;
+    x86_64) srcs="$srcs i386/fp_mode.c" ;;
+  esac
   for f in $srcs; do
     "$CLANG" -target "$arch-apple-macos$min" -isysroot "$SDK" \
       -O2 -fPIC -ffreestanding -fno-builtin -fvisibility=hidden \
-      -c "$B/$f" -o "$b/${f%.c}.o"
+      -c "$B/$f" -o "$b/$(basename "${f%.c}").o"
   done
   libtool -static -o "$dst/clang/lib/darwin/libclang_rt.osx.a" "$b"/*.o
-  nm "$dst/clang/lib/darwin/libclang_rt.osx.a" | grep -q ' T ___addtf3' \
+  # No grep -q under pipefail: an early exit SIGPIPEs nm and reads as failure.
+  nm "$dst/clang/lib/darwin/libclang_rt.osx.a" | grep ' T ___addtf3' >/dev/null \
     || { echo "!! [$arch] TF archive has no ___addtf3" >&2; exit 1; }
+  nm "$dst/clang/lib/darwin/libclang_rt.osx.a" | grep ' T ___fe_getround' >/dev/null \
+    || { echo "!! [$arch] TF archive has no ___fe_getround (fp_mode.c missing)" >&2; exit 1; }
+  nm "$dst/clang/lib/darwin/libclang_rt.osx.a" | grep ' T ___truncsfbf2' >/dev/null \
+    || { echo "!! [$arch] TF archive has no ___truncsfbf2 (bf16 sources missing)" >&2; exit 1; }
 }
 
 for arch in "${ARCHES[@]}"; do

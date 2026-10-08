@@ -6,8 +6,12 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STAGE="$ROOT/staging"; DIST="$ROOT/dist"
-BASE="https://github.com/kairolang/sysroots/releases/download/v1-llvm22"
+BASE="https://github.com/kairolang/kairo-sysroots/releases/download/v1-llvm22"
 OUT="$DIST/manifest.json"
+
+# The compiler-rt bundle is uploaded once and rarely rebuilt; when its tarball
+# is not in dist/, carry the published entry over instead of dropping it.
+prev_rt=$(jq -c '.compiler_rt // empty' "$OUT" 2>/dev/null || true)
 
 tval() { grep -E "^$2[[:space:]]*=" "$1" | head -1 | sed -E 's/^[^=]+=[[:space:]]*//; s/^"//; s/"$//'; }
 
@@ -28,6 +32,11 @@ tval() { grep -E "^$2[[:space:]]*=" "$1" | head -1 | sed -E 's/^[^=]+=[[:space:]
     size=$(stat -c%s "$tar")
     family=$(tval "$toml" family)
     has_libcxx=$(tval "$toml" has_libcxx)
+    glibc=$(tval "$toml" glibc_version || true)
+    resdir=$(tval "$toml" resource_dir || true)
+    # TOML string arrays are JSON as written; local_only tells Kairo which dirs
+    # the user must supply (windows-msvc: msvc/, the Microsoft CRT + SDK)
+    local_only=$(grep -E '^local_only[[:space:]]*=' "$toml" | sed -E 's/^[^=]+=[[:space:]]*//' || true)
     [[ $first -eq 0 ]] && echo ','
     first=0
     printf '    "%s": {\n' "$triple"
@@ -36,7 +45,21 @@ tval() { grep -E "^$2[[:space:]]*=" "$1" | head -1 | sed -E 's/^[^=]+=[[:space:]
     printf '      "sha256": "%s",\n' "$sha"
     printf '      "size": %s,\n' "$size"
     printf '      "family": "%s",\n' "$family"
-    printf '      "has_libcxx": %s\n' "$has_libcxx"
+    # optional keys, comma-joined so the last one carries no trailing comma
+    extra=()
+    [[ -n "$glibc" ]]  && extra+=("$(printf '"glibc_version": "%s"' "$glibc")")
+    [[ -n "$resdir" ]] && extra+=("$(printf '"resource_dir": "%s"' "$resdir")")
+    [[ -n "$local_only" ]] && extra+=("\"local_only\": $local_only")
+    if [[ ${#extra[@]} -gt 0 ]]; then
+      printf '      "has_libcxx": %s,\n' "$has_libcxx"
+      for i in "${!extra[@]}"; do
+        printf '      %s' "${extra[$i]}"
+        [[ $i -lt $((${#extra[@]} - 1)) ]] && printf ','
+        printf '\n'
+      done
+    else
+      printf '      "has_libcxx": %s\n' "$has_libcxx"
+    fi
     printf '    }'
   done
   echo ''
@@ -59,6 +82,9 @@ tval() { grep -E "^$2[[:space:]]*=" "$1" | head -1 | sed -E 's/^[^=]+=[[:space:]
     echo '      "applies_to": ["x86_64-linux-musl","aarch64-linux-musl","armv7-linux-musl","i686-linux-musl","riscv64-linux-musl"]'
     echo '    }'
     echo '  }'
+  elif [[ -n "$prev_rt" ]]; then
+    echo '  ,'
+    echo "  \"compiler_rt\": $prev_rt"
   fi
   echo '}'
 } > "$OUT"

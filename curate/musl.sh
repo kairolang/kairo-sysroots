@@ -7,8 +7,13 @@
 #                                  libc++ headers under c++/v1)
 #   usr/lib/*      -> lib/       (.a archives + crt1/crti/crtn/Scrt1/rcrt1 objects)
 #
-# crtbegin/crtend are NOT shipped: they come from the compiler's compiler-rt
-# resource dir (clang_rt.crtbegin-<arch>.o). See link-templates/ for the proof.
+# compiler-rt lives in the sysroot (resource_dir = "compiler-rt"):
+#   compiler-rt/lib/<arch>-unknown-linux-musl/{clang_rt.crtbegin.o,clang_rt.crtend.o}
+#     copied from fetch-musl-compiler-rt.sh's staging/compiler-rt-musl
+#   .../libclang_rt.builtins.a
+#     Alpine's, as a placeholder; build-builtins.sh then replaces it with one
+#     built from Kairo's LLVM (f128, i128, bf16). Order: fetch-musl-libcxx.sh,
+#     fetch-musl-compiler-rt.sh, musl.sh, build-builtins.sh.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -40,6 +45,7 @@ libcxx_link   = ["-lc++", "-lc++abi", "-lunwind"]
 rtlib         = "compiler-rt"
 unwindlib     = "libunwind"
 linker        = "lld"
+resource_dir  = "compiler-rt"
 cc_isolation  = ["-nostdlibinc", "-nostdinc++"]
 EOF
 }
@@ -61,6 +67,12 @@ for triple in "${TRIPLES[@]}"; do
   cp -a "$src/usr/lib/."     "$dst/lib/"
 
   emit_toml "$triple" "$dst/SYSROOT.toml"
+
+  rt_src="$ROOT/staging/compiler-rt-musl/lib/clang/22/lib/${triple%%-*}-unknown-linux-musl"
+  test -f "$rt_src/clang_rt.crtbegin.o" \
+    || { echo "!! [$triple] no $rt_src; run fetch-musl-compiler-rt.sh first" >&2; exit 1; }
+  mkdir -p "$dst/compiler-rt/lib/${triple%%-*}-unknown-linux-musl"
+  cp -a "$rt_src"/. "$dst/compiler-rt/lib/${triple%%-*}-unknown-linux-musl/"
 
   # sanity
   test -f "$dst/include/c++/v1/vector" || { echo "!! [$triple] no libc++ in staging" >&2; exit 1; }

@@ -25,15 +25,40 @@ rtlib=$(val rtlib)
 unwindlib=$(val unwindlib)
 linker=$(val linker)
 
-inc_flags=();  for d in $(arr include_dirs); do inc_flags+=(-isystem "$ROOT/$d"); done
+family=$(val family)
+inc_flags=()
+for d in $(arr include_dirs); do
+  # windows-msvc: the CRT/SDK dirs go after clang's resource headers, as Kairo
+  # and clang-cl (-imsvc) order them; the UCRT's stddef.h would hide clang's.
+  if [[ "$family" == "windows-msvc" && "$d" != */c++/* ]]; then inc_flags+=(-idirafter "$ROOT/$d")
+  else inc_flags+=(-isystem "$ROOT/$d"); fi
+done
+for d in $(arr cc_defines); do inc_flags+=(-D"$d"); done
 lib_flags=();  for d in $(arr lib_dirs);     do lib_flags+=(-L"$ROOT/$d"); done
 iso_flags=();  for f in $(arr cc_isolation); do iso_flags+=("$f"); done
 xcflags=();    for f in $(arr extra_cflags); do xcflags+=("$f"); done
-cxx_libs=();   for l in $(arr libcxx_link);  do cxx_libs+=("$l"); done
-c_libs=();     for l in $(arr libc_link);    do c_libs+=("$l"); done
+# windows-msvc lists lld-link inputs (libc++.lib); the clang driver spells
+# those -llibc++, which it turns back into libc++.lib on the search path.
+lnk() { if [[ "$1" == *.lib ]]; then echo "-l${1%.lib}"; else echo "$1"; fi; }
+cxx_libs=();   for l in $(arr libcxx_link);  do cxx_libs+=("$(lnk "$l")"); done
+c_libs=();     for l in $(arr libc_link);    do c_libs+=("$(lnk "$l")"); done
 
 cmd=("$CLANG" --target="$triple" --sysroot="$ROOT")
-[[ "$static" == "true" ]] && cmd+=(-static)
+if [[ "$family" == "windows-msvc" ]]; then
+  # static means the static CRT (libcmt); the clang MSVC driver has no -static.
+  # C++ exceptions are off by default on this target.
+  [[ "$static" == "true" ]] && cmd+=(-fms-runtime-lib=static)
+  cmd+=(-fexceptions -fcxx-exceptions)
+  # Builtins come from the sysroot's resource_dir, as Kairo's COFF flavor
+  # finds them; the driver's -rtlib would look in the compiler's instead.
+  rd=$(val resource_dir)
+  for a in "$ROOT/$rd"/lib/windows/clang_rt.builtins-*.lib "$ROOT/$rd"/lib/*-windows-msvc/clang_rt.builtins.lib; do
+    [[ -f "$a" ]] && EXTRA+=(-Wl,"$a")
+  done
+  rtlib=""
+else
+  [[ "$static" == "true" ]] && cmd+=(-static)
+fi
 [[ -n "$rtlib"     ]] && cmd+=(-rtlib="$rtlib")
 [[ -n "$unwindlib" ]] && cmd+=(-unwindlib="$unwindlib")
 [[ -n "$linker"    ]] && cmd+=(-fuse-ld="$linker")
@@ -75,7 +100,6 @@ echo ">> [$triple] link OK"
 file "$out" | sed 's/^/   /'
 
 # run native linux binaries whose arch matches the host; run wasi via node.
-family=$(val family)
 host_arch=$(uname -m)
 tri_arch="${triple%%-*}"
 runnable=0
