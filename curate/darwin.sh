@@ -9,10 +9,25 @@
 # Ours, not Apple's: libc++/libc++abi (LLVM 22, static, hermetic) replace the
 # SDK's, and compiler-rt TF builtins fill what libSystem lacks (binary128).
 #
-# Usage: darwin.sh <kairo-repo> [arm64|x86_64 ...]
+# Example (from the kairo-sysroots checkout, Kairo cloned at ~/kairo):
+#   OUT=~/kairo/build/arm64-apple-macosx/sysroots ./curate/darwin.sh ~/kairo arm64 x86_64 arm64e
+#
+# Expects <kairo-repo> to hold the LLVM fork source at Lib/llvm-runtimes and
+# its build at build/llvm (Scripts/build_llvm.py). Each triple is staged to
+# $OUT/<triple>; any previous stage of that triple is replaced.
+#
+# build_llvm.py builds the libraries Kairo links, not the clang driver, so
+# build/llvm/bin/clang is usually missing. Build it and the clang++ name the
+# libc++ configure needs, from <kairo-repo>:
+#   ninja -C build/llvm clang && ln -sf clang build/llvm/bin/clang++
+# That clang compiles libc++ and the TF builtins for every arch, so it must
+# carry the fork's __float128 patches for each Darwin target requested; the
+# per-arch check below stops before staging if one is missing.
+#
+# Usage: ./curate/darwin.sh <kairo-repo> [arm64|arm64e|x86_64 ...]
 #   OUT=...         default: <this repo>/staging; each triple lands in OUT/<triple>
 #   SDK=...         default: xcrun --sdk macosx --show-sdk-path
-#   MIN_MACOS=...   default: 11.0 (arm64), 10.15 (x86_64)
+#   MIN_MACOS=...   default: 11.0 (arm64, arm64e), 10.15 (x86_64)
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KAIRO="$(cd "${1:?usage: darwin.sh <kairo-repo> [arch...]}" && pwd)"; shift
@@ -35,11 +50,14 @@ for t in cmake ninja rsync libtool nm; do
   command -v $t >/dev/null || { echo "!! need $t" >&2; exit 1; }
 done
 
-# Binary128 needs the fork's HasFloat128 on DarwinAArch64TargetInfo; without
-# it compiler-rt's int_types.h finds no tf_float and the TF sources are empty.
-if ! "$CLANG" -target arm64-apple-macos11 -dM -E -x c /dev/null | grep -q __SIZEOF_FLOAT128__; then
-  echo "!! fork clang has no __float128 on arm64-apple-macos (patch AArch64.cpp first)" >&2; exit 1
-fi
+# Binary128 needs the fork's HasFloat128 on the Darwin target of EACH arch
+# (DarwinAArch64TargetInfo, DarwinX86_64TargetInfo); without it compiler-rt's
+# int_types.h finds no tf_float and the TF sources compile empty. Checked per
+# arch in the loop, before anything is staged.
+check_float128() {   # $1 = arch, $2 = min
+  "$CLANG" -target "$1-apple-macos$2" -dM -E -x c /dev/null | grep -q __SIZEOF_FLOAT128__ \
+    || { echo "!! fork clang has no __float128 on $1-apple-macos (patch its Darwin TargetInfo first)" >&2; exit 1; }
+}
 
 emit_toml() {
   cat >"$2" <<EOF
@@ -123,9 +141,14 @@ build_tf_builtins() {   # $1 = arch, $2 = min, $3 = dst
 for arch in "${ARCHES[@]}"; do
   case "$arch" in
     arm64)  min="${MIN_MACOS:-11.0}" ;;
+    # Pointer-authentication ABI (Xcode 26 "Enhanced Security"). The fork's
+    # clang driver turns on the -fptrauth-* set for an arm64e triple, so
+    # libc++ and the TF builtins come out signed with no extra flags here.
+    arm64e) min="${MIN_MACOS:-11.0}" ;;
     x86_64) min="${MIN_MACOS:-10.15}" ;;
     *) echo "!! unknown arch $arch" >&2; exit 1 ;;
   esac
+  check_float128 "$arch" "$min"
   triple="$arch-apple-macosx"
   dst="$STAGE/$triple"
   echo ">> [$triple] staging from $SDK (min $min) -> $dst"
