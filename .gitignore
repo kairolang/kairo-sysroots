@@ -2,6 +2,9 @@
 /extract/
 /staging/
 /alpine-pull/
+/ubuntu-pull/
+/runtimes-build/
+/runtimes-out/
 
 # release assets live on GitHub Releases, never in git
 *.tar.xz

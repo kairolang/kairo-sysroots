@@ -63,3 +63,25 @@ https://dl-cdn.alpinelinux.org/alpine/edge/main/aarch64/compiler-rt-22.1.3-r0.ap
 https://dl-cdn.alpinelinux.org/alpine/edge/main/armv7/compiler-rt-22.1.3-r0.apk
 https://dl-cdn.alpinelinux.org/alpine/edge/main/x86/compiler-rt-22.1.3-r0.apk
 https://dl-cdn.alpinelinux.org/alpine/edge/main/riscv64/compiler-rt-22.1.3-r0.apk
+[linux-gnu glibc 2.31] (Ubuntu 20.04 focal-updates; pulled by curate/fetch-glibc.sh; i686 == i386, armv7 == armhf)
+http://ports.ubuntu.com/ubuntu-ports/pool/main/g/glibc/libc6-dev_2.31-0ubuntu9.18_arm64.deb
+http://ports.ubuntu.com/ubuntu-ports/pool/main/g/glibc/libc6_2.31-0ubuntu9.18_arm64.deb
+http://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/linux-libc-dev_5.4.0-216.236_arm64.deb
+http://ports.ubuntu.com/ubuntu-ports/pool/main/g/glibc/libc6-dev_2.31-0ubuntu9.18_armhf.deb
+http://ports.ubuntu.com/ubuntu-ports/pool/main/g/glibc/libc6_2.31-0ubuntu9.18_armhf.deb
+http://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/linux-libc-dev_5.4.0-216.236_armhf.deb
+http://archive.ubuntu.com/ubuntu/pool/main/g/glibc/libc6-dev_2.31-0ubuntu9.18_i386.deb
+http://archive.ubuntu.com/ubuntu/pool/main/g/glibc/libc6_2.31-0ubuntu9.18_i386.deb
+http://archive.ubuntu.com/ubuntu/pool/main/l/linux/linux-libc-dev_5.4.0-216.236_i386.deb
+http://ports.ubuntu.com/ubuntu-ports/pool/main/g/glibc/libc6-dev_2.31-0ubuntu9.18_riscv64.deb
+http://ports.ubuntu.com/ubuntu-ports/pool/main/g/glibc/libc6_2.31-0ubuntu9.18_riscv64.deb
+http://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/linux-libc-dev_5.4.0-216.236_riscv64.deb
+http://archive.ubuntu.com/ubuntu/pool/main/g/glibc/libc6-dev_2.31-0ubuntu9.18_amd64.deb
+http://archive.ubuntu.com/ubuntu/pool/main/g/glibc/libc6_2.31-0ubuntu9.18_amd64.deb
+http://archive.ubuntu.com/ubuntu/pool/main/l/linux/linux-libc-dev_5.4.0-216.236_amd64.deb
+[linux-gnu runtimes] built from source by curate/build-glibc-runtimes.sh: llvm-project 22.1.0 (kairo-lang/Lib/llvm-runtimes) compiler-rt, libunwind, libc++abi, libc++
+[windows-msvc] (LOCAL ONLY, never redistributed: Microsoft license. Fetched by the user with xwin 0.10.0, which takes the license acceptance)
+xwin --accept-license --arch x86_64,aarch64,x86 --cache-dir extract/xwin-cache splat --output extract/xwin
+  Microsoft.VC.14.44.17.14.CRT (headers + x64/arm64/x86 Desktop libs)
+  Win11SDK_10.0.26100 (headers, ucrt + um libs for x86_64/aarch64/x86)
+[windows-msvc runtimes] built from source by curate/msvc.sh: llvm-project 22.1.0 (kairo-lang/Lib/llvm-runtimes) compiler-rt builtins, libc++ (vcruntime ABI, /MT)
