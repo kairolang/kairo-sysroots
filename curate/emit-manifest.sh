@@ -6,7 +6,10 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STAGE="$ROOT/staging"; DIST="$ROOT/dist"
-BASE="https://github.com/kairolang/kairo-sysroots/releases/download/v1-llvm22"
+# One tag for both the "release" field and every URL: they drifted once
+# (v1-llvm22 URLs in the v2-llvm22 manifest, every one a 404).
+TAG="${KSYS_RELEASE_TAG:-v2-llvm22}"
+BASE="https://github.com/kairolang/kairo-sysroots/releases/download/$TAG"
 OUT="$DIST/manifest.json"
 
 # The compiler-rt bundle is uploaded once and rarely rebuilt; when its tarball
@@ -17,7 +20,7 @@ tval() { grep -E "^$2[[:space:]]*=" "$1" | head -1 | sed -E 's/^[^=]+=[[:space:]
 
 {
   echo '{'
-  echo '  "release": "v1-llvm22",'
+  echo "  \"release\": \"$TAG\","
   echo '  "llvm_version": "22.1.0",'
   echo '  "targets": {'
   first=1

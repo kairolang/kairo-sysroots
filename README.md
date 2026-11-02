@@ -4,7 +4,7 @@ Hermetic, pre-built sysroots for cross-compiling with **Kairo** (Clang-as-a-libr
 
 A sysroot here is a self-contained directory holding a target's C library headers and archives, a static libc++ (where the target has one), the compiler-rt builtins, and a `SYSROOT.toml` that tells Kairo how to compile and link against it. Kairo never uses the host's headers or libraries, so a build gives the same result on any machine.
 
-- **Release assets** (tarballs plus `manifest.json`) are on GitHub Releases under the tag `v1-llvm22`.
+- **Release assets** (tarballs plus `manifest.json`) are on GitHub Releases under the tag `v2-llvm22`.
 - **This repository** holds only the curation pipeline (`curate/`) and provenance (`DOWNLOADS.md`). Tarballs are never committed.
 
 ---
@@ -65,7 +65,7 @@ See [Local-only targets](#local-only-targets-msvc-and-darwin).
 
 ## Using a sysroot
 
-1. **Download** the tarball for your target and `manifest.json` from the `v1-llvm22` release.
+1. **Download** the tarball for your target and `manifest.json` from the `v2-llvm22` release.
 2. **Verify** it against the manifest:
    ```sh
    jq -r '.targets["x86_64-linux-musl"].sha256' manifest.json
@@ -151,12 +151,12 @@ Every sysroot has a flat `SYSROOT.toml` at its root. All paths are relative to t
 
 ```json
 {
-  "release": "v1-llvm22",
+  "release": "v2-llvm22",
   "llvm_version": "22.1.0",
   "targets": {
     "x86_64-linux-gnu-glibc2.31": {
       "asset": "x86_64-linux-gnu-glibc2.31-llvm22.tar.xz",
-      "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v1-llvm22/...",
+      "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v2-llvm22/...",
       "sha256": "…",
       "size": 5616196,
       "family": "linux-gnu",
@@ -292,7 +292,7 @@ build/x86_64-linux-gnu/debug/bin/kairo --sysroot=<sysroot-dir> \
 bash curate/tar-dist.sh                  # every sysroot in staging/ (darwin skipped, msvc/ excluded)
 bash curate/tar-dist.sh x86_64-linux-musl   # or specific ones
 bash curate/emit-manifest.sh                # regenerate dist/manifest.json; checks it is valid JSON
-gh release upload v1-llvm22 dist/* --clobber
+gh release upload v2-llvm22 dist/* --clobber
 ```
 
 - `tar-dist.sh` runs `decompress-debug.sh` first, so no tarball contains zlib-compressed debug sections, which an lld built without zlib refuses to link. It then packs with sorted names and zero owner, keeping symlinks as symlinks.

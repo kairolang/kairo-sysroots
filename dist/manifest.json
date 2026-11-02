@@ -1,10 +1,10 @@
 {
-  "release": "v1-llvm22",
+  "release": "v2-llvm22",
   "llvm_version": "22.1.0",
   "targets": {
     "aarch64-linux-gnu-glibc2.31": {
       "asset": "aarch64-linux-gnu-glibc2.31-llvm22.tar.xz",
-      "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v1-llvm22/aarch64-linux-gnu-glibc2.31-llvm22.tar.xz",
+      "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v2-llvm22/aarch64-linux-gnu-glibc2.31-llvm22.tar.xz",
       "sha256": "522ea98e3a490d2adf81d85eec96f288bae1a4dd4baddebdabfcfe53d74580db",
       "size": 4968764,
       "family": "linux-gnu",
@@ -14,7 +14,7 @@
     },
     "aarch64-linux-musl": {
       "asset": "aarch64-linux-musl-llvm22.tar.xz",
-      "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v1-llvm22/aarch64-linux-musl-llvm22.tar.xz",
+      "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v2-llvm22/aarch64-linux-musl-llvm22.tar.xz",
       "sha256": "7ec775dc29e973dc4b88978f3abd997f4ebd72d0697703f6430cf3b3f6360c3d",
       "size": 6428380,
       "family": "linux-musl",
@@ -23,7 +23,7 @@
     },
     "aarch64-unknown-freebsd": {
       "asset": "aarch64-unknown-freebsd-llvm22.tar.xz",
-      "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v1-llvm22/aarch64-unknown-freebsd-llvm22.tar.xz",
+      "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v2-llvm22/aarch64-unknown-freebsd-llvm22.tar.xz",
       "sha256": "2a5122193eeeaf634d84b20b44ef42338d57f73e455631130e0613cb7c252e18",
       "size": 93437724,
       "family": "freebsd",
@@ -32,7 +32,7 @@
     },
     "aarch64-windows-gnu": {
       "asset": "aarch64-windows-gnu-llvm22.tar.xz",
-      "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v1-llvm22/aarch64-windows-gnu-llvm22.tar.xz",
+      "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v2-llvm22/aarch64-windows-gnu-llvm22.tar.xz",
       "sha256": "a0f8503fc59f9d914bf29a715c696930811338bfa1a39824bc8ac3a591b74716",
       "size": 11377636,
       "family": "windows-gnu",
@@ -41,7 +41,7 @@
     },
     "armv7-linux-gnueabihf-glibc2.31": {
       "asset": "armv7-linux-gnueabihf-glibc2.31-llvm22.tar.xz",
-      "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v1-llvm22/armv7-linux-gnueabihf-glibc2.31-llvm22.tar.xz",
+      "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v2-llvm22/armv7-linux-gnueabihf-glibc2.31-llvm22.tar.xz",
       "sha256": "2351515e0a8c28ea0623bba9ff58e0d1d85313ac75d8ceada587bcc60004fc94",
       "size": 5116692,
       "family": "linux-gnu",
@@ -51,7 +51,7 @@
     },
     "armv7-linux-musl": {
       "asset": "armv7-linux-musl-llvm22.tar.xz",
-      "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v1-llvm22/armv7-linux-musl-llvm22.tar.xz",
+      "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v2-llvm22/armv7-linux-musl-llvm22.tar.xz",
       "sha256": "615c4246674f9e55948595f514912ac7dab0abbf71568c5a53a723ca8e55a3e0",
       "size": 6411172,
       "family": "linux-musl",
@@ -60,7 +60,7 @@
     },
     "armv7-windows-gnu": {
       "asset": "armv7-windows-gnu-llvm22.tar.xz",
-      "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v1-llvm22/armv7-windows-gnu-llvm22.tar.xz",
+      "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v2-llvm22/armv7-windows-gnu-llvm22.tar.xz",
       "sha256": "f891cec2d9db5aa70a73ac2dbe635333e99f1ee685c84b6514ec14183b426308",
       "size": 12201748,
       "family": "windows-gnu",
@@ -69,7 +69,7 @@
     },
     "i686-linux-gnu-glibc2.31": {
       "asset": "i686-linux-gnu-glibc2.31-llvm22.tar.xz",
-      "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v1-llvm22/i686-linux-gnu-glibc2.31-llvm22.tar.xz",
+      "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v2-llvm22/i686-linux-gnu-glibc2.31-llvm22.tar.xz",
       "sha256": "3de88e56d5c9b862a1484ea5c05bd7061cea5da9c87007b3acf1f32e74f6a3c3",
       "size": 5581824,
       "family": "linux-gnu",
@@ -79,7 +79,7 @@
     },
     "i686-linux-musl": {
       "asset": "i686-linux-musl-llvm22.tar.xz",
-      "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v1-llvm22/i686-linux-musl-llvm22.tar.xz",
+      "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v2-llvm22/i686-linux-musl-llvm22.tar.xz",
       "sha256": "941e0a0990dd0b0105e4527a731d4aee529a0983c61cb486d0529f8176e35a95",
       "size": 6544440,
       "family": "linux-musl",
@@ -88,7 +88,7 @@
     },
     "i686-windows-gnu": {
       "asset": "i686-windows-gnu-llvm22.tar.xz",
-      "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v1-llvm22/i686-windows-gnu-llvm22.tar.xz",
+      "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v2-llvm22/i686-windows-gnu-llvm22.tar.xz",
       "sha256": "6eba3f4d49ac14db3f78a66dae533463e842cd4d98e1b21e0085e7ec8af7de19",
       "size": 12382048,
       "family": "windows-gnu",
@@ -97,7 +97,7 @@
     },
     "riscv64-linux-gnu-glibc2.31": {
       "asset": "riscv64-linux-gnu-glibc2.31-llvm22.tar.xz",
-      "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v1-llvm22/riscv64-linux-gnu-glibc2.31-llvm22.tar.xz",
+      "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v2-llvm22/riscv64-linux-gnu-glibc2.31-llvm22.tar.xz",
       "sha256": "5f70e076b3378f972cbea41c054c637d22641cc2c902d1b522930c9070b360a5",
       "size": 7042540,
       "family": "linux-gnu",
@@ -107,7 +107,7 @@
     },
     "riscv64-linux-musl": {
       "asset": "riscv64-linux-musl-llvm22.tar.xz",
-      "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v1-llvm22/riscv64-linux-musl-llvm22.tar.xz",
+      "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v2-llvm22/riscv64-linux-musl-llvm22.tar.xz",
       "sha256": "c7b47b4128804067923b4b603bc2c1464d0690fdf3ae4a36d2e18537a1031084",
       "size": 8786496,
       "family": "linux-musl",
@@ -116,7 +116,7 @@
     },
     "wasm32-wasi": {
       "asset": "wasm32-wasi-llvm22.tar.xz",
-      "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v1-llvm22/wasm32-wasi-llvm22.tar.xz",
+      "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v2-llvm22/wasm32-wasi-llvm22.tar.xz",
       "sha256": "dcfdbc2579d06477e0419d03f925b7461b2ec49b672f2f0deebafdede452c8ab",
       "size": 16185892,
       "family": "wasi",
@@ -125,7 +125,7 @@
     },
     "x86_64-linux-gnu-glibc2.31": {
       "asset": "x86_64-linux-gnu-glibc2.31-llvm22.tar.xz",
-      "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v1-llvm22/x86_64-linux-gnu-glibc2.31-llvm22.tar.xz",
+      "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v2-llvm22/x86_64-linux-gnu-glibc2.31-llvm22.tar.xz",
       "sha256": "72308072d8ef4b5fe482aa146102c82031bf95d7de78ff3614b791f2619b0a92",
       "size": 5615984,
       "family": "linux-gnu",
@@ -135,7 +135,7 @@
     },
     "x86_64-linux-musl": {
       "asset": "x86_64-linux-musl-llvm22.tar.xz",
-      "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v1-llvm22/x86_64-linux-musl-llvm22.tar.xz",
+      "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v2-llvm22/x86_64-linux-musl-llvm22.tar.xz",
       "sha256": "de7b2117192efd4fd4b46816e0fbd399846befc456b3bfc9278f82eb06257f08",
       "size": 6544572,
       "family": "linux-musl",
@@ -144,7 +144,7 @@
     },
     "x86_64-unknown-freebsd": {
       "asset": "x86_64-unknown-freebsd-llvm22.tar.xz",
-      "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v1-llvm22/x86_64-unknown-freebsd-llvm22.tar.xz",
+      "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v2-llvm22/x86_64-unknown-freebsd-llvm22.tar.xz",
       "sha256": "af645d0afd5d14d1d7e4e03c91d28995083f2dfe139616007041dc9c6b08f356",
       "size": 100422904,
       "family": "freebsd",
@@ -153,7 +153,7 @@
     },
     "x86_64-unknown-netbsd": {
       "asset": "x86_64-unknown-netbsd-llvm22.tar.xz",
-      "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v1-llvm22/x86_64-unknown-netbsd-llvm22.tar.xz",
+      "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v2-llvm22/x86_64-unknown-netbsd-llvm22.tar.xz",
       "sha256": "3f148f85546b2ee07caec02ae1af56f0a4184fcfc078cf50ded984f0d16f6843",
       "size": 58901656,
       "family": "netbsd",
@@ -162,7 +162,7 @@
     },
     "x86_64-windows-gnu": {
       "asset": "x86_64-windows-gnu-llvm22.tar.xz",
-      "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v1-llvm22/x86_64-windows-gnu-llvm22.tar.xz",
+      "url": "https://github.com/kairolang/kairo-sysroots/releases/download/v2-llvm22/x86_64-windows-gnu-llvm22.tar.xz",
       "sha256": "bc72cef9ba4b7f8275bee5df6089daae9e0b3a3a315f558738af86221e39ed8d",
       "size": 12661764,
       "family": "windows-gnu",
