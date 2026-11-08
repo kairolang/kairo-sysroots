@@ -1,0 +1,33 @@
+family       = "freebsd"
+provider     = "bundle"
+arches       = ["x86_64", "aarch64"]
+clang_triple = "{arch}-unknown-freebsd{os_version}"
+inputs       = ["freebsd/{os_version}/{arch}"]
+os_version   = "14.4"
+bundle_layout = { "include" = "usr/include", "lib" = "usr/lib" }   # restore the depth the base tree had
+runtimes     = ["builtins", "unwind", "cxxabi", "cxx"]
+cxx_abi      = "libcxxabi"
+sysname      = "FreeBSD"
+os_dir       = "freebsd"
+static_only  = true
+runtimes_dir    = "libcxx"                                       # libcxx/include/c++/v1, libcxx/lib
+resource_layout = "compiler-rt/lib/freebsd"
+builtins_name   = "libclang_rt.builtins-{arch}.a"
+
+[toml]
+include_dirs = ["libcxx/include/c++/v1", "usr/include"]
+lib_dirs     = ["libcxx/lib", "usr/lib"]
+has_libcxx   = true
+static       = true
+crt_startup  = ["crt1.o", "crti.o"]
+crt_end      = ["crtn.o"]
+libc_link    = ["-lm", "-lthr", "-lc"]
+libcxx_link  = ["-lc++", "-lc++abi", "-lunwind"]
+rtlib        = "compiler-rt"
+unwindlib    = "libunwind"
+linker       = "lld"
+resource_dir = "compiler-rt"
+cc_isolation = ["-nostdlibinc", "-nostdinc++"]
+
+[validate]
+run = "link-only"

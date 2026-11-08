@@ -1,0 +1,74 @@
+# Predicate + effects. All matching entries apply in file order. At most one
+# entry may set target_rewrite for a given target; two is an error.
+# Predicate fields: arch, os, env, objfmt, driver, provider, int128 (probe result).
+
+[[quirk]]
+id  = "armv7-musl-hardfloat"
+why = "Alpine-style armv7 musl is AAPCS-VFP; a plain -musl triple makes clang assume soft-float"
+when = { arch = ["armv7", "armv6"], os = "linux", env = "musl" }
+target_rewrite = "{arch}-unknown-linux-musleabihf"
+musl_arch = "arm"
+
+[[quirk]]
+id  = "armv7-gnu-hardfloat"
+why = "focal armhf is gnueabihf; the glibc blob is built --host=arm-linux-gnueabihf"
+when = { arch = ["armv7"], os = "linux", env = "gnu" }
+target_rewrite = "armv7-unknown-linux-gnueabihf"
+
+[[quirk]]
+id  = "int128-software"
+why = "no native __int128: Kairo i128 and f128 lower to __divti3 / __addtf3 & co., which compiler-rt only builds with the flag"
+when = { int128 = false, driver = "gnu" }
+cflags = { stages = ["builtins", "runtimes"], add = ["-fforce-enable-int128"] }
+cmake  = { stages = ["builtins"], defs = { COMPILER_RT_ENABLE_SOFTWARE_INT128 = "ON" } }
+
+[[quirk]]
+id  = "int128-software-cl"
+why = "clang-cl drops the plain spelling; without -Xclang the TF/int128 sources compile empty"
+when = { int128 = false, driver = "cl" }
+cflags = { stages = ["builtins", "runtimes"], add = ["-Xclang", "-fforce-enable-int128"] }
+cmake  = { stages = ["builtins"], defs = { COMPILER_RT_ENABLE_SOFTWARE_INT128 = "ON" } }
+
+[[quirk]]
+id  = "mingw-atomics-in-builtins"
+why = "MinGW has no libatomic; __atomic_* must live in the builtins (compiler-rt excludes atomic.c by default)"
+when = { os = "windows", env = "gnu" }
+cmake = { stages = ["builtins"], defs = { COMPILER_RT_EXCLUDE_ATOMIC_BUILTIN = "OFF" } }
+required_symbols = ["__atomic_load", "__atomic_compare_exchange"]
+
+[[quirk]]
+id  = "coff-tf-compare-aliases"
+why = "COMPILER_RT_ALIAS is empty on non-MinGW _WIN32: __eqtf2/__netf2/__lttf2/__gttf2/__cmptf2 do not exist"
+when = { env = "msvc" }
+post_archive = { stage = "builtins", sources = ["shims/tf-compare-aliases.c"], cflags = ["-I{runtimes}/compiler-rt/lib/builtins"] }
+required_symbols = ["__eqtf2", "__netf2", "__lttf2", "__gttf2", "__cmptf2"]
+
+[[quirk]]
+id  = "msvc-config-site-static"
+why = "a libc++ __config_site without _LIBCPP_DISABLE_VISIBILITY_ANNOTATIONS imports __imp_ symbols from a DLL that is not there"
+when = { env = "msvc" }
+assert_file_contains = { file = "include/c++/v1/__config_site", text = "_LIBCPP_DISABLE_VISIBILITY_ANNOTATIONS" }
+
+[[quirk]]
+id  = "freebsd-aarch64-getauxval"
+why = "libunwind's aarch64 SME probe calls getauxval; FreeBSD 14 only has elf_aux_info"
+when = { arch = ["aarch64"], os = "freebsd" }
+force_include = { stages = ["runtimes"], file = "shims/freebsd-getauxval.h" }
+
+[[quirk]]
+id  = "netbsd-no-libdl"
+why = "dlopen is in libc; compile-only try_compile passes check_library_exists(dl) and libunwind then demands a libdl no static link can give"
+when = { os = "netbsd" }
+cmake = { stages = ["runtimes"], defs = { LIBUNWIND_HAS_DL_LIB = "OFF" } }
+
+[[quirk]]
+id  = "bsd-nostdincxx"
+why = "the base tree has its own c++/v1 (libc++ 19 / libstdc++); it must not shadow ours during the runtimes build"
+when = { os = ["freebsd", "netbsd"] }
+cflags = { stages = ["runtimes"], add_cxx = ["-nostdinc++"] }
+
+[[quirk]]
+id  = "wasm-bf16-lowering"
+why = "a frontend that accepts __bf16 is not enough; the WebAssembly backend must legalize it or the configure check reads as no"
+when = { arch = ["wasm32"] }
+assert_compiles = { source = "__bf16 f(__bf16 x) { return x; }\n__bf16 g(float x) { return (__bf16)x; }\n", opt = ["-O0", "-O2"] }

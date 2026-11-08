@@ -106,6 +106,12 @@ static inline unsigned long getauxval(int type) {
 EOH
     cxx_extra="-include $bld/freebsd_getauxval.h"
   fi
+  # NetBSD has no libdl (dlopen/dladdr are in libc). With compile-only
+  # try_compile, check_library_exists(dl dladdr) passes anyway, and libunwind
+  # then embeds a `dl` dependent-library request that no static NetBSD link
+  # can satisfy (kairo-lang P460). FreeBSD ships a real libdl.a.
+  unwind_extra=()
+  if [[ "$os" == netbsd ]]; then unwind_extra=(-DLIBUNWIND_HAS_DL_LIB=OFF); fi
   echo ">> [$name] configuring runtimes for $triple"
   # try_compile stays compile-only: there is no libc++ or builtins to link
   # against until this build produces them. -nostdinc++ keeps the base
@@ -140,6 +146,7 @@ EOH
     -DCOMPILER_RT_BUILD_CTX_PROFILE=OFF \
     -DCOMPILER_RT_INCLUDE_TESTS=OFF \
     -DLIBUNWIND_ENABLE_SHARED=OFF \
+    "${unwind_extra[@]}" \
     -DLIBUNWIND_USE_COMPILER_RT=ON \
     -DLIBCXXABI_ENABLE_SHARED=OFF \
     -DLIBCXXABI_USE_LLVM_UNWINDER=ON \

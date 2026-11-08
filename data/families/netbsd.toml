@@ -1,0 +1,33 @@
+family       = "netbsd"
+provider     = "bundle"
+arches       = ["x86_64"]
+clang_triple = "{arch}-unknown-netbsd{os_version}"
+inputs       = ["netbsd/{os_version}/{arch}"]
+os_version   = "10.1"
+bundle_layout = { "include" = "usr/include", "lib" = "usr/lib" }
+runtimes     = ["builtins", "unwind", "cxxabi", "cxx"]
+cxx_abi      = "libcxxabi"
+sysname      = "NetBSD"
+os_dir       = "netbsd"
+static_only  = true
+runtimes_dir    = "libcxx"
+resource_layout = "compiler-rt/lib/netbsd"
+builtins_name   = "libclang_rt.builtins-{arch}.a"
+
+[toml]
+include_dirs = ["libcxx/include/c++/v1", "usr/include"]
+lib_dirs     = ["libcxx/lib", "usr/lib"]
+has_libcxx   = true
+static       = true
+crt_startup  = ["crt0.o", "crti.o"]
+crt_end      = ["crtn.o"]
+libc_link    = ["-lm", "-lpthread", "-lc"]
+libcxx_link  = ["-lc++", "-lc++abi", "-lunwind"]
+rtlib        = "compiler-rt"
+unwindlib    = "libunwind"
+linker       = "lld"
+resource_dir = "compiler-rt"
+cc_isolation = ["-nostdlibinc", "-nostdinc++"]
+
+[validate]
+run = "link-only"

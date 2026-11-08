@@ -1,0 +1,7 @@
+# exit codes the validate stage expects when a program is run
+"t.c"      = 7
+"t.cpp"    = 12
+"test.k"   = 0
+"floats.k" = 5
+"tfbf.k"   = 1
+base_required_symbols = ["__addtf3", "__netf2", "__divti3", "__extendhfsf2", "__truncsfhf2", "__truncsfbf2", "__truncdfbf2", "__trunctfbf2"]

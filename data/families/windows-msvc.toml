@@ -1,0 +1,37 @@
+family       = "windows-msvc"
+provider     = "user"
+user_input   = "xwin splat (xwin --accept-license --arch ... splat --output DIR)"
+user_input_marker = "sdk/include/um/Windows.h"
+arches       = ["x86_64", "i686", "aarch64"]
+clang_triple = "{arch}-pc-windows-msvc"
+inputs       = []
+runtimes     = ["builtins", "cxx"]
+cxx_abi      = "vcruntime"
+driver       = "cl"
+sysname      = "Windows"
+os_dir       = "windows"
+static_only  = true
+resource_layout = "compiler-rt/lib/windows"
+builtins_name   = "clang_rt.builtins-{arch}.lib"
+local_only      = ["msvc"]
+redistributable = true
+
+[toml]
+include_dirs = ["include/c++/v1", "msvc/crt/include", "msvc/sdk/include/ucrt", "msvc/sdk/include/um", "msvc/sdk/include/shared"]
+lib_dirs     = ["lib", "msvc/crt/lib/{xa}", "msvc/sdk/lib/um/{xa}", "msvc/sdk/lib/ucrt/{xa}"]
+has_libcxx   = true
+static       = true
+crt_startup  = []
+crt_end      = []
+libc_link    = ["libcmt.lib", "libvcruntime.lib", "libucrt.lib", "oldnames.lib", "kernel32.lib", "user32.lib", "advapi32.lib", "shell32.lib", "uuid.lib"]
+libcxx_link  = ["libc++.lib"]
+rtlib        = "compiler-rt"
+linker       = "lld-link"
+resource_dir = "compiler-rt"
+msvc_crt     = "static"
+local_only   = ["msvc"]
+cc_defines   = ["_CRT_STDIO_ISO_WIDE_SPECIFIERS"]
+cc_isolation = ["-nostdlibinc", "-nostdinc++"]
+
+[validate]
+run = "wine-if-present"

@@ -1,0 +1,94 @@
+# Every upstream input, pinned. sha256 = "FILL" is recorded by `PIN=1 ship.sh`
+# on first fetch and must be committed. License names are what registry.toml
+# carries into the release.
+
+[musl]
+version = "1.2.6"
+url     = "https://musl.libc.org/releases/musl-1.2.6.tar.gz"
+sha256  = "FILL"
+license = "MIT"
+
+[linux]
+version = "6.12"
+url     = "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.tar.xz"
+sha256  = "FILL"
+license = "GPL-2.0 WITH Linux-syscall-note"
+
+[glibc-2.28]
+version = "2.28"
+url     = "https://ftp.gnu.org/gnu/glibc/glibc-2.28.tar.xz"
+sha256  = "FILL"
+license = "LGPL-2.1-or-later"
+
+[glibc-2.31]
+version = "2.31"
+url     = "https://ftp.gnu.org/gnu/glibc/glibc-2.31.tar.xz"
+sha256  = "FILL"
+license = "LGPL-2.1-or-later"
+
+[glibc-2.34]
+version = "2.34"
+url     = "https://ftp.gnu.org/gnu/glibc/glibc-2.34.tar.xz"
+sha256  = "FILL"
+license = "LGPL-2.1-or-later"
+
+[glibc-2.35]
+version = "2.35"
+url     = "https://ftp.gnu.org/gnu/glibc/glibc-2.35.tar.xz"
+sha256  = "FILL"
+license = "LGPL-2.1-or-later"
+
+[glibc-2.38]
+version = "2.38"
+url     = "https://ftp.gnu.org/gnu/glibc/glibc-2.38.tar.xz"
+sha256  = "FILL"
+license = "LGPL-2.1-or-later"
+
+[glibc-2.41]
+version = "2.41"
+url     = "https://ftp.gnu.org/gnu/glibc/glibc-2.41.tar.xz"
+sha256  = "FILL"
+license = "LGPL-2.1-or-later"
+
+[mingw-w64]
+version = "13.0.0"
+url     = "https://sourceforge.net/projects/mingw-w64/files/mingw-w64/mingw-w64-release/mingw-w64-v13.0.0.tar.bz2/download"
+sha256  = "FILL"
+license = "ZPL-2.1 AND LicenseRef-mingw-w64-public-domain"
+
+[llvm-mingw]
+# toolchain used only to BUILD mingw-w64-crt on the maintainer box; nothing of it ships
+version = "20260224"
+url     = "https://github.com/mstorsjo/llvm-mingw/releases/download/20260224/llvm-mingw-20260224-ucrt-ubuntu-22.04-x86_64.tar.xz"
+sha256  = "FILL"
+license = "Apache-2.0 WITH LLVM-exception"
+
+[freebsd-14.4-x86_64]
+version = "14.4"
+url     = "https://download.freebsd.org/releases/amd64/14.4-RELEASE/base.txz"
+sha256  = "FILL"
+license = "BSD-2-Clause"
+
+[freebsd-14.4-aarch64]
+version = "14.4"
+url     = "https://download.freebsd.org/releases/arm64/aarch64/14.4-RELEASE/base.txz"
+sha256  = "FILL"
+license = "BSD-2-Clause"
+
+[netbsd-10.1-x86_64-base]
+version = "10.1"
+url     = "https://cdn.netbsd.org/pub/NetBSD/NetBSD-10.1/amd64/binary/sets/base.tar.xz"
+sha256  = "FILL"
+license = "BSD-2-Clause"
+
+[netbsd-10.1-x86_64-comp]
+version = "10.1"
+url     = "https://cdn.netbsd.org/pub/NetBSD/NetBSD-10.1/amd64/binary/sets/comp.tar.xz"
+sha256  = "FILL"
+license = "BSD-2-Clause"
+
+[wasi-sysroot]
+version = "33"
+url     = "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-33/wasi-sysroot-33.0+m.tar.gz"
+sha256  = "FILL"
+license = "Apache-2.0 WITH LLVM-exception AND MIT AND CC0-1.0"

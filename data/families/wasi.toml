@@ -1,0 +1,31 @@
+family       = "wasi"
+provider     = "bundle"
+arches       = ["wasm32"]
+clang_triple = "wasm32-unknown-wasi"
+inputs       = ["wasi/33"]
+bundle_layout = { "include" = "include", "lib" = "lib" }
+runtimes     = ["builtins"]                       # libc++ kept from the bundle (same fork commit)
+cxx_abi      = "libcxxabi"
+sysname      = "WASI"
+os_dir       = "wasi"
+static_only  = true
+baremetal    = true
+resource_layout = "compiler-rt/lib/wasm32-unknown-wasi"
+builtins_name   = "libclang_rt.builtins.a"
+
+[toml]
+include_dirs = ["include/wasm32-wasi/eh/c++/v1", "include/wasm32-wasi"]
+lib_dirs     = ["lib/wasm32-wasi/eh", "lib/wasm32-wasi"]
+has_libcxx   = true
+static       = false
+crt_startup  = ["crt1-command.o"]
+crt_end      = []
+libc_link    = ["-lc"]
+libcxx_link  = ["-lc++", "-lc++abi", "-lunwind"]
+extra_cflags = ["-fwasm-exceptions"]
+cc_isolation = ["-nostdlibinc", "-nostdinc++"]
+rtlib        = "compiler-rt"
+resource_dir = "compiler-rt"
+
+[validate]
+run = "wasmtime-or-node-if-present"

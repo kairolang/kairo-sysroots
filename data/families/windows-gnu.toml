@@ -1,0 +1,31 @@
+family       = "windows-gnu"
+provider     = "mingw"
+arches       = ["x86_64", "i686", "aarch64", "armv7"]
+clang_triple = "{arch}-w64-windows-gnu"
+inputs       = ["mingw"]
+runtimes     = ["builtins", "unwind", "cxxabi", "cxx"]  # crtbegin/end come from mingw crt/
+cxx_abi      = "libcxxabi"
+cxxabi_merged_into_cxx = true                          # libc++.a bundles the abi, as llvm-mingw does
+sysname      = "Windows"
+os_dir       = "windows"
+static_only  = true
+resource_layout = "compiler-rt/lib/windows"
+builtins_name   = "libclang_rt.builtins-{rt_arch}.a"   # rt_arch: i686->i386, armv7->arm
+
+[toml]
+include_dirs = ["include/c++/v1", "include"]
+lib_dirs     = ["lib"]
+has_libcxx   = true
+static       = true
+crt_startup  = ["crt2.o", "crtbegin.o"]
+crt_end      = ["crtend.o"]
+libc_link    = ["-lmingw32", "-lmoldname", "-lmingwex", "-lmsvcrt", "-ladvapi32", "-lshell32", "-luser32", "-lkernel32"]
+libcxx_link  = ["-lc++", "-lunwind"]
+rtlib        = "compiler-rt"
+unwindlib    = "libunwind"
+linker       = "lld"
+resource_dir = "compiler-rt"
+cc_isolation = ["-nostdlibinc", "-nostdinc++"]
+
+[validate]
+run = "wine-if-present"

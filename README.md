@@ -172,95 +172,17 @@ Optional per-target keys: `glibc_version`, `resource_dir`, `local_only`. The dow
 
 ---
 
-## Building sysroots from source
+## Release inputs (`share/kairo/sysroot/`)
 
-### Prerequisites
+`bash curate/ship.sh` builds the input tree a Kairo release ships. From it,
+`kairo sysroot build <target>` constructs any supported sysroot offline. The
+maintainer box needs: Debian cross-GCC for the five glibc arches, bison,
+autoconf, cmake, ninja, llvm-objcopy/readobj. First run: `PIN=1 bash
+curate/ship.sh` to record sha256 pins into `curate/sources.toml`; commit them.
 
-- Linux x86_64 host with `bash`, `cmake`, `ninja`, `tar`/`xz`, `curl`, `jq`, `llvm-objcopy`, `llvm-readobj`.
-- A kairo-lang checkout next to this repo (`../kairo-lang`) with:
-  - the LLVM fork source at `Lib/llvm-runtimes`,
-  - its built clang at `build/llvm/bin/clang` (and `clang++`, `clang-cl`, `lld-link`). Build them with `ninja -C build/llvm clang lld`, plus `ln -sf clang build/llvm/bin/clang++`.
-
-  The fork's clang is required wherever runtimes are built from source. It carries the `__float128` patches, without which compiler-rt's quad-float routines silently compile to nothing.
-- For MSVC: `xwin` (`cargo install xwin --locked`).
-
-Every staging script writes `staging/<sysroot>/` and replaces anything already there.
-
-### Per-family pipelines
-
-Upstream URLs and exact versions for every input are in `DOWNLOADS.md`.
-
-**linux-gnu (glibc 2.31)**: fully scripted.
-```sh
-bash curate/fetch-glibc.sh              # Ubuntu 20.04 debs -> extract/<name>/
-bash curate/build-glibc-runtimes.sh     # libc++, libc++abi, libunwind, compiler-rt from source
-bash curate/glibc.sh                    # -> staging/<arch>-linux-gnu*-glibc2.31/
-```
-
-**linux-musl**: download the Alpine `musl-dev`, `linux-headers`, `libc++-static` and `llvm-libunwind-static` apks listed in `DOWNLOADS.md`, and unpack each arch's set into `extract/<arch>-linux-musl/`. Then:
-```sh
-bash curate/fetch-musl-libcxx.sh        # grafts libc++ headers into extract/
-bash curate/fetch-musl-compiler-rt.sh   # Alpine crtbegin/crtend -> staging/compiler-rt-musl/
-bash curate/musl.sh                     # -> staging/<arch>-linux-musl/
-bash curate/build-builtins.sh           # compiler-rt builtins from the fork (f128, i128, bf16)
-```
-
-**windows-gnu**: unpack `llvm-mingw-20260224-ucrt-ubuntu-22.04-x86_64.tar.xz` into `extract/mingw/`, then run `bash curate/mingw.sh` and `bash curate/build-builtins.sh`. The builtins are built from the fork rather than taken from llvm-mingw. llvm-mingw's were built by a stock clang and lack f128 and the 32-bit i128 routines.
-
-**FreeBSD / NetBSD**: unpack FreeBSD `base.txz` into `extract/<arch>-unknown-freebsd/`, and NetBSD `base.tar.xz` plus `comp.tar.xz` into `extract/x86_64-unknown-netbsd/`. Then run `bash curate/freebsd.sh` or `bash curate/netbsd.sh`, then `bash curate/build-bsd-runtimes.sh`. The staging scripts keep `usr/include`, `usr/lib` and `lib` as they are, so the base system's relative symlinks still resolve. `build-bsd-runtimes.sh` adds LLVM 22 libc++/libc++abi/libunwind (`libcxx/`) and compiler-rt builtins (`compiler-rt/lib/<os>/`) built from the fork. FreeBSD's base libc++ is 19, and NetBSD's base has only libstdc++.
-
-**wasm32-wasi**: unpack `wasi-sysroot-33.0+m.tar.gz` into `extract/wasm32-wasi/`, then `bash curate/wasi.sh`. Then run `bash curate/build-wasi-builtins.sh` to build the compiler-rt builtins (including bf16) from the fork's source into `compiler-rt/lib/wasm32-unknown-wasi/`.
-
-**windows-msvc / darwin**: see the next section.
-
----
-
-## Local-only targets: MSVC and Darwin
-
-Microsoft's and Apple's licenses allow using their SDKs but not redistributing them. This repository therefore ships only **instructions and our own compiled code**, never vendor files. **You accept the vendor license yourself, on your own machine.**
-
-### windows-msvc (x86_64, aarch64/ARM64, i686/x86)
-
-1. **Fetch the CRT and SDK.** This step accepts [Microsoft's license terms](https://go.microsoft.com/fwlink/?LinkId=2086102); read them first:
-   ```sh
-   xwin --accept-license --arch x86_64,aarch64,x86 \
-        --cache-dir extract/xwin-cache splat --output extract/xwin
-   ```
-   That's about 1.6 GB. It writes `extract/xwin/{crt,sdk}` with lowercase symlinks, so `#include <Windows.h>` resolves on a case-sensitive filesystem.
-2. **Build the sysroots:**
-   ```sh
-   bash curate/msvc.sh ../kairo-lang                  # all three
-   bash curate/msvc.sh ../kairo-lang arm64 i386       # aliases accepted
-   ```
-   For each arch, this copies the splat into `staging/<arch>-windows-msvc/msvc/` and builds libc++ (vcruntime ABI, static CRT `/MT`) and the compiler-rt builtins with the fork's `clang-cl`. It writes `SYSROOT.toml`, then links a C++ test program twice: once directly and once replayed from the TOML.
-
-Resulting layout:
-```
-<arch>-windows-msvc/
-  SYSROOT.toml
-  include/c++/v1/                                   ours
-  lib/libc++.lib                                    ours
-  compiler-rt/lib/windows/clang_rt.builtins-<arch>.lib   ours
-  msvc/                                             Microsoft, local_only
-```
-Binaries are fully static: an x86_64 test binary imports only `KERNEL32.dll` and needs no VC++ redistributable.
-
-**What a consumer must do** (details in `curate/link-templates/windows-msvc.recipe.md`):
-- Search the CRT/SDK headers *after* clang's resource headers.
-- Define `_CRT_STDIO_ISO_WIDE_SPECIFIERS`. libc++ is built with it, and the UCRT's `/failifmismatch` rejects a mismatch at link time.
-- Compile in MS language mode (`-fms-extensions -fms-compatibility`).
-
-`tar-dist.sh` packs these sysroots **without** `msvc/`. The result is about 1.4 MB of LLVM-licensed code, and the user supplies their own splat in `msvc/`.
-
-### darwin (arm64, arm64e, x86_64)
-
-Run on a Mac with Xcode installed. Apple's license only allows the SDK on Apple-branded hardware.
-```sh
-bash curate/darwin.sh <kairo-repo> arm64 x86_64 arm64e
-```
-This stages the local Apple SDK (`xcrun --sdk macosx --show-sdk-path`), with Apple's libc++ replaced by ours and compiler-rt quad-float builtins added. Its `SYSROOT.toml` says `redistributable = false`, and `tar-dist.sh` refuses to pack it.
-
----
+The old `curate/<family>.sh` + `build-*.sh` pipeline stays until
+`kairo sysroot build` reproduces each family's `SYSROOT.toml` and validates;
+then that family's scripts are deleted.
 
 ## Validating a sysroot
 

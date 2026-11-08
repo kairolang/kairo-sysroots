@@ -1,0 +1,37 @@
+family       = "darwin"
+provider     = "user"
+user_input   = "macOS SDK (xcrun --sdk macosx --show-sdk-path)"
+user_input_marker = "SDKSettings.json"
+host_only    = "darwin"                           # refuses on any other host until cross is proven
+arches       = ["arm64", "arm64e", "x86_64"]
+clang_triple = "{arch}-apple-macos{min_macos}"
+min_macos    = { arm64 = "11.0", arm64e = "11.0", x86_64 = "10.15" }
+inputs       = []
+runtimes     = ["cxx", "cxxabi", "builtins-subset"]
+cxx_abi      = "libcxxabi"
+cxx_hermetic = true
+cxxabi_merged_into_cxx = true
+builtins_subset = ["@GENERIC_TF_SOURCES", "@BF16_SOURCES", "{fp_arch}/fp_mode.c"]
+sysname      = "Darwin"
+os_dir       = "darwin"
+static_only  = true
+resource_layout = "clang/lib/darwin"
+builtins_name   = "libclang_rt.osx.a"
+redistributable = false
+
+[toml]
+resource_dir = "clang"
+include_dirs = ["usr/include/c++/v1", "usr/include"]
+lib_dirs     = ["usr/lib"]
+has_libcxx   = true
+static       = false
+crt_startup  = []
+crt_end      = []
+libc_link    = ["-lSystem"]
+libcxx_link  = ["-lc++"]
+rtlib        = "compiler-rt"
+linker       = "lld"
+cc_isolation = ["-nostdlibinc", "-nostdinc++"]
+
+[validate]
+run = "native-if-host"

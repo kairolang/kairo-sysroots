@@ -1,0 +1,3 @@
+#include <stdio.h>
+#include <string.h>
+int main(void) { char b[16]; strcpy(b, "hello-c"); return (int)strlen(b); }

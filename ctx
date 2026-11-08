@@ -1,0 +1,2337 @@
+
+
+==== curate/build-bsd-runtimes.sh === 
+
+#!/usr/bin/env bash
+# Build LLVM 22's C++ runtimes and compiler-rt builtins from Kairo's own LLVM
+# source for the FreeBSD and NetBSD sysroots, against each base system's own
+# headers and libc, and install them beside the base system:
+#
+#   staging/<name>/libcxx/include/c++/v1       libc++ headers (LLVM 22)
+#   staging/<name>/libcxx/lib/{libc++,libc++abi,libunwind}.a   static, PIC
+#   staging/<name>/compiler-rt/lib/<os>/libclang_rt.builtins-<arch>.a
+#
+# Why not the base system's C++ runtime: FreeBSD 14.4 ships libc++ 19 on
+# libcxxrt, NetBSD 10.1 ships GCC 10's libstdc++ (no libc++ at all). Kairo's
+# C++ interop builds against libc++ 22 on every other target. And why not
+# base libgcc: NetBSD's is GCC's (no f16/bf16 routines), FreeBSD's is
+# compiler-rt 19 (no __trunctfbf2). Built here, every target gets the same
+# runtime set, and static libc++ means a Kairo binary needs no C++ runtime
+# on the target.
+#
+# The base tree is left as is (usr/include/c++/v1 on FreeBSD stays libc++ 19
+# for C interop with base C++ libraries); SYSROOT.toml puts libcxx/ first.
+# Run after freebsd.sh / netbsd.sh (which replace staging/<name> wholesale);
+# this script also rewrites their SYSROOT.toml to the libc++ form.
+#
+# Env: LLVM_SRC   llvm-project checkout (default: kairo-lang/Lib/llvm-runtimes)
+#      CC / CXX   Kairo's own clang (default: kairo-lang/build/llvm/bin/clang{,++})
+#
+# Usage: build-bsd-runtimes.sh [<name> ...]   (default: every staged *-freebsd / *-netbsd)
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LLVM_SRC="${LLVM_SRC:-$ROOT/../kairo-lang/Lib/llvm-runtimes}"
+KBIN="$ROOT/../kairo-lang/build/llvm/bin"
+CC="${CC:-$KBIN/clang}"
+CXX="${CXX:-$KBIN/clang++}"
+command -v "$CC" >/dev/null || { echo "!! no clang at $CC (set CC/CXX)" >&2; exit 1; }
+test -f "$LLVM_SRC/runtimes/CMakeLists.txt" || { echo "!! no llvm-project at $LLVM_SRC (set LLVM_SRC)" >&2; exit 1; }
+tool() { if [[ -x "$KBIN/$1" ]]; then echo "$KBIN/$1"; else command -v "$1" || { echo "!! need $1" >&2; exit 1; }; fi; }
+AR=$(tool llvm-ar); RANLIB=$(tool llvm-ranlib); NM=$(tool llvm-nm)
+
+# sysroot name -> clang target triple (with the base release it targets)
+declare -A TRIPLE=(
+  [x86_64-unknown-freebsd]=x86_64-unknown-freebsd14.4
+  [aarch64-unknown-freebsd]=aarch64-unknown-freebsd14.4
+  [x86_64-unknown-netbsd]=x86_64-unknown-netbsd10.1
+)
+
+# The libc++ form of the BSD manifests. crt objects are the base system's.
+# crtbegin*/crtend are not listed: Kairo's linker adds the right variant
+# itself (crtbeginT.o for -static), as on glibc. libc++ needs the threads
+# library for std::thread.
+emit_toml() {   # $1 = name, $2 = os (freebsd|netbsd), $3 = out
+  local name="$1" os="$2" start thr
+  if [[ "$os" == freebsd ]]; then start=crt1.o; thr=-lthr
+  else                            start=crt0.o; thr=-lpthread; fi
+  cat >"$3" <<EOF
+triple        = "$name"
+llvm_version  = "22.1.0"
+family        = "$os"
+sysroot       = "."
+include_dirs  = ["libcxx/include/c++/v1", "usr/include"]
+lib_dirs      = ["libcxx/lib", "usr/lib", "lib"]
+has_libcxx    = true
+static        = true
+crt_startup   = ["$start", "crti.o"]
+crt_end       = ["crtn.o"]
+libc_link     = ["-lm", "$thr", "-lc"]
+libcxx_link   = ["-lc++", "-lc++abi", "-lunwind"]
+rtlib         = "compiler-rt"
+unwindlib     = "libunwind"
+linker        = "lld"
+resource_dir  = "compiler-rt"
+cc_isolation  = ["-nostdlibinc", "-nostdinc++"]
+EOF
+}
+
+names=("$@")
+[[ ${#names[@]} -eq 0 ]] && mapfile -t names < <(cd "$ROOT/staging" && ls -d *-freebsd/ *-netbsd/ 2>/dev/null | tr -d /)
+
+for name in "${names[@]}"; do
+  sr="$ROOT/staging/$name"
+  triple="${TRIPLE[$name]:-}"
+  [[ -n "$triple" ]] || { echo "!! [$name] no clang triple known for this sysroot" >&2; exit 1; }
+  test -f "$sr/usr/include/stdio.h" || { echo "!! [$name] not staged; run freebsd.sh / netbsd.sh" >&2; exit 1; }
+  arch="${name%%-*}"
+  case "$name" in *-freebsd) os=freebsd; sysname=FreeBSD ;; *-netbsd) os=netbsd; sysname=NetBSD ;; esac
+  "$CC" --target="$triple" -dM -E -x c /dev/null | grep __SIZEOF_FLOAT128__ >/dev/null \
+    || { echo "!! [$name] $CC has no __float128 on $triple" >&2; exit 1; }
+
+  bld="$ROOT/runtimes-build/$name"
+  out="$ROOT/runtimes-out/$name"
+  rm -rf "$bld" "$out"; mkdir -p "$bld"
+
+  # LLVM 22's libunwind (Registers.hpp, the aarch64 SME check) calls
+  # getauxval() whenever <sys/auxv.h> exists. FreeBSD 14 has the header but
+  # only elf_aux_info(), so the aarch64 build fails with "undeclared
+  # identifier 'getauxval'". Force-include a getauxval built on elf_aux_info
+  # into the C++ compiles (no C runtime declares it on FreeBSD, so nothing
+  # can clash).
+  cxx_extra=""
+  if [[ "$os" == freebsd && "$arch" == aarch64 ]]; then
+    cat >"$bld/freebsd_getauxval.h" <<'EOH'
+#pragma once
+#include <sys/auxv.h>
+static inline unsigned long getauxval(int type) {
+  unsigned long v = 0;
+  return elf_aux_info(type, &v, sizeof v) == 0 ? v : 0;
+}
+EOH
+    cxx_extra="-include $bld/freebsd_getauxval.h"
+  fi
+  # NetBSD has no libdl (dlopen/dladdr are in libc). With compile-only
+  # try_compile, check_library_exists(dl dladdr) passes anyway, and libunwind
+  # then embeds a `dl` dependent-library request that no static NetBSD link
+  # can satisfy (kairo-lang P460). FreeBSD ships a real libdl.a.
+  unwind_extra=()
+  if [[ "$os" == netbsd ]]; then unwind_extra=(-DLIBUNWIND_HAS_DL_LIB=OFF); fi
+  echo ">> [$name] configuring runtimes for $triple"
+  # try_compile stays compile-only: there is no libc++ or builtins to link
+  # against until this build produces them. -nostdinc++ keeps the base
+  # system's libc++ 19 headers (usr/include/c++/v1) out of every compile.
+  cmake -G Ninja -S "$LLVM_SRC/runtimes" -B "$bld" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX="$out" \
+    -DCMAKE_SYSTEM_NAME="$sysname" \
+    -DCMAKE_C_COMPILER="$CC" -DCMAKE_CXX_COMPILER="$CXX" -DCMAKE_ASM_COMPILER="$CC" \
+    -DCMAKE_C_COMPILER_TARGET="$triple" -DCMAKE_CXX_COMPILER_TARGET="$triple" \
+    -DCMAKE_ASM_COMPILER_TARGET="$triple" \
+    -DCMAKE_AR="$AR" -DCMAKE_RANLIB="$RANLIB" \
+    -DCMAKE_SYSROOT="$sr" \
+    -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+    -DCMAKE_C_FLAGS="-fPIC -fforce-enable-int128" \
+    -DCMAKE_CXX_FLAGS="-fPIC -nostdinc++ $cxx_extra" \
+    -DLLVM_ENABLE_RUNTIMES="compiler-rt;libunwind;libcxxabi;libcxx" \
+    -DLLVM_DEFAULT_TARGET_TRIPLE="$triple" \
+    -DLLVM_ENABLE_PER_TARGET_RUNTIME_DIR=OFF \
+    -DLLVM_INCLUDE_TESTS=OFF \
+    -DCOMPILER_RT_DEFAULT_TARGET_ONLY=ON \
+    -DCOMPILER_RT_BUILD_BUILTINS=ON \
+    -DCOMPILER_RT_ENABLE_SOFTWARE_INT128=ON \
+    -DCOMPILER_RT_BUILD_CRT=OFF \
+    -DCOMPILER_RT_BUILD_SANITIZERS=OFF \
+    -DCOMPILER_RT_BUILD_XRAY=OFF \
+    -DCOMPILER_RT_BUILD_LIBFUZZER=OFF \
+    -DCOMPILER_RT_BUILD_PROFILE=OFF \
+    -DCOMPILER_RT_BUILD_MEMPROF=OFF \
+    -DCOMPILER_RT_BUILD_ORC=OFF \
+    -DCOMPILER_RT_BUILD_CTX_PROFILE=OFF \
+    -DCOMPILER_RT_INCLUDE_TESTS=OFF \
+    -DLIBUNWIND_ENABLE_SHARED=OFF \
+    "${unwind_extra[@]}" \
+    -DLIBUNWIND_USE_COMPILER_RT=ON \
+    -DLIBCXXABI_ENABLE_SHARED=OFF \
+    -DLIBCXXABI_USE_LLVM_UNWINDER=ON \
+    -DLIBCXXABI_USE_COMPILER_RT=ON \
+    -DLIBCXX_ENABLE_SHARED=OFF \
+    -DLIBCXX_CXX_ABI=libcxxabi \
+    -DLIBCXX_USE_COMPILER_RT=ON \
+    -DLIBCXX_INCLUDE_BENCHMARKS=OFF \
+    -DLIBCXX_ENABLE_STATIC_ABI_LIBRARY=OFF \
+    >"$bld/configure.log" 2>&1 \
+    || { tail -30 "$bld/configure.log" >&2; echo "!! [$name] configure failed ($bld/configure.log)" >&2; exit 1; }
+
+  echo ">> [$name] building"
+  ninja -C "$bld" install >"$bld/build.log" 2>&1 \
+    || { grep -m20 -E "error|FAILED" "$bld/build.log" >&2; echo "!! [$name] build failed ($bld/build.log)" >&2; exit 1; }
+
+  rt=$(find "$out" -name 'libclang_rt.builtins*.a' | head -1)
+  [[ -n "$rt" ]] || { echo "!! [$name] no builtins archive under $out" >&2; exit 1; }
+  for f in lib/libc++.a lib/libc++abi.a lib/libunwind.a include/c++/v1/vector; do
+    test -f "$out/$f" || { echo "!! [$name] missing $f" >&2; exit 1; }
+  done
+  # grep reads to EOF (no -q): an early exit would SIGPIPE nm under pipefail.
+  syms=$("$NM" "$rt" 2>/dev/null | awk '$2 == "T" { print $3 }')
+  for sym in __addtf3 __netf2 __divti3 __extendhfsf2 __truncsfhf2 __truncsfbf2 __truncdfbf2 __trunctfbf2; do
+    grep -x -- "$sym" <<<"$syms" >/dev/null || { echo "!! [$name] builtins have no $sym" >&2; exit 1; }
+  done
+
+  rm -rf "$sr/libcxx" "$sr/compiler-rt"
+  mkdir -p "$sr/libcxx/include" "$sr/libcxx/lib" "$sr/compiler-rt/lib/$os"
+  cp -a "$out/include/c++" "$sr/libcxx/include/"
+  cp "$out/lib/libc++.a" "$out/lib/libc++abi.a" "$out/lib/libunwind.a" "$sr/libcxx/lib/"
+  # __config_site is per target; libc++ installs it under include/<triple>/
+  # when the per-target dir is on, include/c++/v1 otherwise. Either way it
+  # must sit beside the headers that include it.
+  test -f "$sr/libcxx/include/c++/v1/__config_site" || { echo "!! [$name] no __config_site" >&2; exit 1; }
+  cp "$rt" "$sr/compiler-rt/lib/$os/libclang_rt.builtins-$arch.a"
+  emit_toml "$name" "$os" "$sr/SYSROOT.toml"
+  echo ">> [$name] runtimes -> libcxx/, compiler-rt/lib/$os/; SYSROOT.toml now has_libcxx = true"
+done
+
+
+==== curate/build-builtins.sh === 
+
+#!/usr/bin/env bash
+# Build compiler-rt builtins from Kairo's own LLVM source for the linux-musl
+# and windows-gnu sysroots, replacing the prebuilt archives they shipped with
+# (Alpine's compiler-rt apk, llvm-mingw's bundle):
+#
+#   staging/<arch>-linux-musl/compiler-rt/lib/<arch>-unknown-linux-musl/libclang_rt.builtins.a
+#   staging/<arch>-windows-gnu/compiler-rt/lib/windows/libclang_rt.builtins-<rtarch>.a
+#
+# Why: those were built by a stock clang. It has no __float128 on most of
+# these targets and does not force __int128 on the 32-bit ones, so the
+# quad-float (__addtf3, __netf2, ...) and __int128 (__divti3, ...) routines
+# that Kairo's f128 and i128 lower to are missing. It also has no
+# __trunctfbf2 outside x86_64. Built here with the fork's clang and
+# COMPILER_RT_ENABLE_SOFTWARE_INT128, every target gets the full set.
+#
+# Only the builtins archive is replaced. musl's clang_rt.crtbegin/crtend.o
+# stay as staged (they hold no float code).
+#
+# Run after musl.sh / mingw.sh (which replace staging/<sysroot> wholesale).
+#
+# Env: LLVM_SRC   llvm-project checkout (default: kairo-lang/Lib/llvm-runtimes)
+#      CC / CXX   Kairo's own clang (default: kairo-lang/build/llvm/bin/clang{,++})
+#
+# Usage: build-builtins.sh [<sysroot> ...]   (default: every staged *-linux-musl
+#                                             and *-windows-gnu)
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LLVM_SRC="${LLVM_SRC:-$ROOT/../kairo-lang/Lib/llvm-runtimes}"
+CC="${CC:-$ROOT/../kairo-lang/build/llvm/bin/clang}"
+KBIN="$(dirname "$CC")"
+# aarch64 has a C++ source (emupac.cpp); without this CMake picks the host c++
+CXX="${CXX:-$KBIN/clang++}"
+command -v "$CC" >/dev/null || { echo "!! no clang at $CC (set CC)" >&2; exit 1; }
+test -f "$LLVM_SRC/compiler-rt/lib/builtins/CMakeLists.txt" || { echo "!! no compiler-rt at $LLVM_SRC (set LLVM_SRC)" >&2; exit 1; }
+tool() { if [[ -x "$KBIN/$1" ]]; then echo "$KBIN/$1"; else command -v "$1" || { echo "!! need $1" >&2; exit 1; }; fi; }
+AR=$(tool llvm-ar); RANLIB=$(tool llvm-ranlib); NM=$(tool llvm-nm)
+
+names=("$@")
+[[ ${#names[@]} -eq 0 ]] && mapfile -t names < <(cd "$ROOT/staging" && ls -d *-linux-musl/ *-windows-gnu/ 2>/dev/null | tr -d /)
+
+for name in "${names[@]}"; do
+  sr="$ROOT/staging/$name"
+  arch="${name%%-*}"
+  extra=()
+  case "$name" in
+    *-linux-musl)
+      sysname=Linux
+      # armv7: Alpine's armv7 is hard-float (VFPv3, AAPCS-VFP); a plain
+      # -musl triple makes clang assume soft-float, a different call ABI.
+      if [[ "$arch" == armv7 ]]; then target=armv7-unknown-linux-musleabihf; else target="$arch-unknown-linux-musl"; fi
+      dst_dir="$sr/compiler-rt/lib/$arch-unknown-linux-musl"
+      dst_name=libclang_rt.builtins.a ;;
+    *-windows-gnu)
+      sysname=Windows
+      target="$arch-w64-windows-gnu"
+      dst_dir="$sr/compiler-rt/lib/windows"
+      case "$arch" in i686) rtarch=i386 ;; armv7) rtarch=arm ;; *) rtarch="$arch" ;; esac
+      dst_name="libclang_rt.builtins-$rtarch.a"
+      # MinGW has no libatomic: llvm-mingw puts __atomic_* in the builtins,
+      # and so must we (compiler-rt leaves atomic.c out by default).
+      extra=(-DCOMPILER_RT_EXCLUDE_ATOMIC_BUILTIN=OFF) ;;
+    *) echo "!! [$name] not a linux-musl or windows-gnu sysroot" >&2; exit 1 ;;
+  esac
+  test -f "$sr/SYSROOT.toml" || { echo "!! [$name] not staged" >&2; exit 1; }
+  "$CC" --target="$target" -dM -E -x c /dev/null | grep __SIZEOF_FLOAT128__ >/dev/null \
+    || { echo "!! [$name] $CC has no __float128 on $target" >&2; exit 1; }
+
+  bld="$ROOT/runtimes-build/builtins-$name"
+  out="$ROOT/runtimes-out/builtins-$name"
+  rm -rf "$bld" "$out"; mkdir -p "$bld"
+  echo ">> [$name] configuring compiler-rt builtins for $target"
+  # Standalone builtins build against the staged sysroot's headers only.
+  # -fforce-enable-int128 directly as well as via SOFTWARE_INT128: the CMake
+  # configure checks (e.g. the bf16 one) must see the same compiler.
+  cmake -G Ninja -S "$LLVM_SRC/compiler-rt/lib/builtins" -B "$bld" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX="$out" \
+    -DCMAKE_SYSTEM_NAME="$sysname" \
+    -DCMAKE_C_COMPILER="$CC" -DCMAKE_ASM_COMPILER="$CC" -DCMAKE_CXX_COMPILER="$CXX" \
+    -DCMAKE_C_COMPILER_TARGET="$target" -DCMAKE_ASM_COMPILER_TARGET="$target" \
+    -DCMAKE_CXX_COMPILER_TARGET="$target" \
+    -DCMAKE_CXX_FLAGS="-nostdlibinc -nostdinc++ -isystem $sr/include -fforce-enable-int128" \
+    -DCMAKE_AR="$AR" -DCMAKE_RANLIB="$RANLIB" \
+    -DCMAKE_SYSROOT="$sr" \
+    -DCMAKE_C_FLAGS="-nostdlibinc -isystem $sr/include -fforce-enable-int128" \
+    -DCMAKE_ASM_FLAGS="-nostdlibinc -isystem $sr/include" \
+    -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+    -DCOMPILER_RT_DEFAULT_TARGET_ONLY=ON \
+    -DCOMPILER_RT_ENABLE_SOFTWARE_INT128=ON \
+    -DCOMPILER_RT_INCLUDE_TESTS=OFF \
+    -DLLVM_ENABLE_PER_TARGET_RUNTIME_DIR=OFF \
+    "${extra[@]}" \
+    >"$bld/configure.log" 2>&1 \
+    || { tail -30 "$bld/configure.log" >&2; echo "!! [$name] configure failed ($bld/configure.log)" >&2; exit 1; }
+  grep -E 'COMPILER_RT_HAS_[a-z0-9_]+_BFLOAT16:INTERNAL=1' "$bld/CMakeCache.txt" >/dev/null \
+    || { echo "!! [$name] configure did not detect __bf16 ($bld/CMakeCache.txt)" >&2; exit 1; }
+
+  echo ">> [$name] building"
+  ninja -C "$bld" install >"$bld/build.log" 2>&1 \
+    || { grep -m20 -E "error|FAILED" "$bld/build.log" >&2; echo "!! [$name] build failed ($bld/build.log)" >&2; exit 1; }
+
+  a=$(find "$out" -name 'libclang_rt.builtins*.a' | head -1)
+  [[ -n "$a" ]] || { echo "!! [$name] no builtins archive under $out" >&2; exit 1; }
+  # grep reads to EOF (no -q): an early exit would SIGPIPE nm under pipefail.
+  syms=$("$NM" "$a" 2>/dev/null | awk '$2 == "T" { print $3 }' | sed 's/^_\(__\)/\1/')
+  req=(__addtf3 __netf2 __divti3 __extendhfsf2 __truncsfhf2 __truncsfbf2 __truncdfbf2 __trunctfbf2)
+  [[ "$name" == *-windows-gnu ]] && req+=(__atomic_load __atomic_compare_exchange)
+  for sym in "${req[@]}"; do
+    grep -x -- "$sym" <<<"$syms" >/dev/null || { echo "!! [$name] $a has no $sym" >&2; exit 1; }
+  done
+  mkdir -p "$dst_dir"
+  cp "$a" "$dst_dir/$dst_name"
+  echo ">> [$name] builtins -> ${dst_dir#$ROOT/}/$dst_name"
+done
+
+
+==== curate/build-glibc-runtimes.sh === 
+
+#!/usr/bin/env bash
+# Build the LLVM runtimes for each linux-gnu sysroot from Kairo's own LLVM
+# source (the same tree Kairo's clang is built from), against the pristine
+# focal root fetch-glibc.sh unpacked:
+#
+#   compiler-rt  builtins + crtbegin/crtend   -> runtimes-out/<name>/rt/
+#   libunwind, libc++abi, libc++  (static, PIC) -> runtimes-out/<name>/{include,lib}
+#
+# Ubuntu's own libc++ is not used: focal ships LLVM 10, and anything built on
+# a newer distro may reference glibc symbols past 2.31. Built here, every
+# glibc reference resolves against the 2.31 stubs, so the floor holds.
+# Static only: a Kairo binary then needs nothing beyond glibc on the target.
+#
+# Env: LLVM_SRC   llvm-project checkout (default: kairo-lang/Lib/llvm-runtimes)
+#      CC / CXX   Kairo's own clang (default: kairo-lang/build/llvm/bin/clang).
+#                 A stock clang has no __float128 on armv7, so compiler-rt's
+#                 quad-float routines would silently compile to nothing there.
+#
+# compiler-rt is built with COMPILER_RT_ENABLE_SOFTWARE_INT128: on the 32-bit
+# targets that adds the __int128 routines (__divti3, ...) and, with the
+# Kairo clang patch, the quad-float ones (__addtf3, ...), which Kairo's i128
+# and f128 lower to.
+#
+# Usage: build-glibc-runtimes.sh [<name> ...]   (default: all extract/*-glibc*)
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LLVM_SRC="${LLVM_SRC:-$ROOT/../kairo-lang/Lib/llvm-runtimes}"
+KCLANG="$ROOT/../kairo-lang/build/llvm/bin"
+CC="${CC:-$KCLANG/clang}"
+CXX="${CXX:-$KCLANG/clang++}"
+command -v "$CC" >/dev/null || { echo "!! no clang at $CC (build it: ninja -C kairo-lang/build/llvm clang, or set CC/CXX)" >&2; exit 1; }
+test -f "$LLVM_SRC/runtimes/CMakeLists.txt" || { echo "!! no llvm-project at $LLVM_SRC (set LLVM_SRC)" >&2; exit 1; }
+
+# name -> clang target triple: the manifest triple, minus the -glibc<v> tag.
+triple_of() { echo "${1%-glibc*}"; }
+
+names=("$@")
+[[ ${#names[@]} -eq 0 ]] && mapfile -t names < <(cd "$ROOT/extract" && ls -d *-glibc*/ | tr -d /)
+
+for name in "${names[@]}"; do
+  sr="$ROOT/extract/$name"
+  test -d "$sr/usr/include" || { echo "!! [$name] not extracted; run fetch-glibc.sh" >&2; exit 1; }
+  triple=$(triple_of "$name")
+  bld="$ROOT/runtimes-build/$name"
+  out="$ROOT/runtimes-out/$name"
+  rm -rf "$bld" "$out"
+  mkdir -p "$bld"
+  echo ">> [$name] configuring runtimes for $triple"
+
+  # try_compile stays compile-only: there is no libc++ or builtins to link
+  # against until this build produces them.
+  cmake -G Ninja -S "$LLVM_SRC/runtimes" -B "$bld" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX="$out" \
+    -DCMAKE_C_COMPILER="$CC" \
+    -DCMAKE_CXX_COMPILER="$CXX" \
+    -DCMAKE_ASM_COMPILER="$CC" \
+    -DCMAKE_C_COMPILER_TARGET="$triple" \
+    -DCMAKE_CXX_COMPILER_TARGET="$triple" \
+    -DCMAKE_ASM_COMPILER_TARGET="$triple" \
+    -DCMAKE_SYSROOT="$sr" \
+    -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+    -DCMAKE_C_FLAGS="-fPIC" \
+    -DCMAKE_CXX_FLAGS="-fPIC" \
+    -DLLVM_ENABLE_RUNTIMES="compiler-rt;libunwind;libcxxabi;libcxx" \
+    -DLLVM_DEFAULT_TARGET_TRIPLE="$triple" \
+    -DLLVM_ENABLE_PER_TARGET_RUNTIME_DIR=OFF \
+    -DLLVM_INCLUDE_TESTS=OFF \
+    -DCOMPILER_RT_DEFAULT_TARGET_ONLY=ON \
+    -DCOMPILER_RT_BUILD_BUILTINS=ON \
+    -DCOMPILER_RT_ENABLE_SOFTWARE_INT128=ON \
+    -DCOMPILER_RT_BUILD_CRT=ON \
+    -DCOMPILER_RT_BUILD_SANITIZERS=OFF \
+    -DCOMPILER_RT_BUILD_XRAY=OFF \
+    -DCOMPILER_RT_BUILD_LIBFUZZER=OFF \
+    -DCOMPILER_RT_BUILD_PROFILE=OFF \
+    -DCOMPILER_RT_BUILD_MEMPROF=OFF \
+    -DCOMPILER_RT_BUILD_ORC=OFF \
+    -DCOMPILER_RT_BUILD_CTX_PROFILE=OFF \
+    -DCOMPILER_RT_INCLUDE_TESTS=OFF \
+    -DLIBUNWIND_ENABLE_SHARED=OFF \
+    -DLIBUNWIND_USE_COMPILER_RT=ON \
+    -DLIBCXXABI_ENABLE_SHARED=OFF \
+    -DLIBCXXABI_USE_LLVM_UNWINDER=ON \
+    -DLIBCXXABI_USE_COMPILER_RT=ON \
+    -DLIBCXX_ENABLE_SHARED=OFF \
+    -DLIBCXX_CXX_ABI=libcxxabi \
+    -DLIBCXX_USE_COMPILER_RT=ON \
+    -DLIBCXX_INCLUDE_BENCHMARKS=OFF \
+    -DLIBCXX_ENABLE_STATIC_ABI_LIBRARY=OFF \
+    >"$bld/configure.log" 2>&1 \
+    || { tail -30 "$bld/configure.log" >&2; echo "!! [$name] configure failed ($bld/configure.log)" >&2; exit 1; }
+
+  echo ">> [$name] building"
+  ninja -C "$bld" install >"$bld/build.log" 2>&1 \
+    || { grep -m20 -E "error|FAILED" "$bld/build.log" >&2; echo "!! [$name] build failed ($bld/build.log)" >&2; exit 1; }
+
+  # Gather compiler-rt from wherever this layout put it: lib/linux/ with
+  # -<arch> suffixes when the per-target dir is off.
+  mkdir -p "$out/rt"
+  b=$(find "$out" -name 'libclang_rt.builtins*.a' | head -1)
+  cb=$(find "$out" -name 'clang_rt.crtbegin*.o' | head -1)
+  ce=$(find "$out" -name 'clang_rt.crtend*.o' | head -1)
+  [[ -n "$b" && -n "$cb" && -n "$ce" ]] || { echo "!! [$name] compiler-rt incomplete" >&2; exit 1; }
+  cp "$b" "$out/rt/libclang_rt.builtins.a"
+  cp "$cb" "$out/rt/clang_rt.crtbegin.o"
+  cp "$ce" "$out/rt/clang_rt.crtend.o"
+
+  for f in lib/libc++.a lib/libc++abi.a lib/libunwind.a include/c++/v1/vector; do
+    test -f "$out/$f" || { echo "!! [$name] missing $f" >&2; exit 1; }
+  done
+  echo ">> [$name] runtimes -> $out"
+done
+
+
+==== curate/build-wasi-builtins.sh === 
+
+#!/usr/bin/env bash
+# Build compiler-rt builtins for wasm32-wasi from Kairo's own LLVM source,
+# against the wasi-libc headers wasi.sh staged, and install them into
+# staging/wasm32-wasi/compiler-rt/lib/wasm32-unknown-wasi/libclang_rt.builtins.a
+# (where resource_dir = "compiler-rt" points).
+#
+# Why not wasi-sdk's prebuilt libclang_rt: it is built by a clang without
+# __bf16 on wasm, and compiler-rt only compiles its bf16 routines when the
+# configure check finds __bf16, so that archive has no __truncsfbf2 and
+# friends. Kairo's bf16 lowers to them. The fork's clang accepts __bf16 on
+# wasm, so building here picks them up. The f16 (__extendhfsf2, ...) and
+# quad-float (__addtf3, ...; wasm32 long double is binary128) routines are
+# built either way.
+#
+# Run after wasi.sh (which replaces staging/wasm32-wasi wholesale).
+#
+# Env: LLVM_SRC   llvm-project checkout (default: kairo-lang/Lib/llvm-runtimes)
+#      CC         Kairo's own clang (default: kairo-lang/build/llvm/bin/clang)
+#
+# Usage: build-wasi-builtins.sh
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LLVM_SRC="${LLVM_SRC:-$ROOT/../kairo-lang/Lib/llvm-runtimes}"
+KBIN="$ROOT/../kairo-lang/build/llvm/bin"
+CC="${CC:-$KBIN/clang}"
+TRIPLE=wasm32-unknown-wasi
+SR="$ROOT/staging/wasm32-wasi"
+BLD="$ROOT/runtimes-build/wasm32-wasi-builtins"
+OUT="$ROOT/runtimes-out/wasm32-wasi-builtins"
+DST="$SR/compiler-rt/lib/$TRIPLE"
+
+command -v "$CC" >/dev/null || { echo "!! no clang at $CC (set CC)" >&2; exit 1; }
+test -f "$LLVM_SRC/compiler-rt/lib/builtins/CMakeLists.txt" || { echo "!! no compiler-rt at $LLVM_SRC (set LLVM_SRC)" >&2; exit 1; }
+test -f "$SR/include/wasm32-wasi/stdlib.h" || { echo "!! no staged wasm32-wasi; run wasi.sh first" >&2; exit 1; }
+AR="$(dirname "$CC")/llvm-ar";         [[ -x "$AR" ]]     || AR=$(command -v llvm-ar)
+RANLIB="$(dirname "$CC")/llvm-ranlib"; [[ -x "$RANLIB" ]] || RANLIB=$(command -v llvm-ranlib)
+NM="$(dirname "$CC")/llvm-nm";         [[ -x "$NM" ]]     || NM=$(command -v llvm-nm)
+
+# The configure check this whole script exists for, plus real codegen: a
+# frontend that accepts __bf16 is not enough. The WebAssembly backend also
+# needs bf16 legalized (extload / truncstore / BF16_TO_FP / FP_TO_BF16 set to
+# Expand in WebAssemblyISelLowering.cpp, as f16 already is), or it dies with
+# "Cannot select: ... anyext from bf16" and the configure check reads as no.
+for o in -O0 -O2; do
+  printf '__bf16 f(__bf16 x) { return x; }\n__bf16 g(float x) { return (__bf16)x; }\n' \
+    | "$CC" --target="$TRIPLE" -c "$o" -x c - -o /dev/null 2>/dev/null \
+    || { echo "!! $CC cannot compile __bf16 for $TRIPLE at $o (frontend or WebAssembly backend bf16 lowering missing)" >&2; exit 1; }
+done
+
+rm -rf "$BLD" "$OUT"; mkdir -p "$BLD"
+echo ">> [$TRIPLE] configuring compiler-rt builtins"
+# Standalone builtins build, as wasi-sdk does it: baremetal (no OS runtime
+# beyond libc headers), default target only, static archive only.
+cmake -G Ninja -S "$LLVM_SRC/compiler-rt/lib/builtins" -B "$BLD" \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX="$OUT" \
+  -DCMAKE_SYSTEM_NAME=WASI \
+  -DCMAKE_C_COMPILER="$CC" -DCMAKE_ASM_COMPILER="$CC" \
+  -DCMAKE_C_COMPILER_TARGET="$TRIPLE" -DCMAKE_ASM_COMPILER_TARGET="$TRIPLE" \
+  -DCMAKE_AR="$AR" -DCMAKE_RANLIB="$RANLIB" \
+  -DCMAKE_SYSROOT="$SR" \
+  -DCMAKE_C_FLAGS="-isystem $SR/include/wasm32-wasi" \
+  -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+  -DCOMPILER_RT_BAREMETAL_BUILD=ON \
+  -DCOMPILER_RT_DEFAULT_TARGET_ONLY=ON \
+  -DCOMPILER_RT_INCLUDE_TESTS=OFF \
+  -DCOMPILER_RT_OS_DIR=wasi \
+  -DLLVM_ENABLE_PER_TARGET_RUNTIME_DIR=OFF \
+  >"$BLD/configure.log" 2>&1 \
+  || { tail -30 "$BLD/configure.log" >&2; echo "!! configure failed ($BLD/configure.log)" >&2; exit 1; }
+grep -q 'COMPILER_RT_HAS_wasm32_BFLOAT16:INTERNAL=1' "$BLD/CMakeCache.txt" \
+  || { echo "!! configure did not detect __bf16 for wasm32 ($BLD/CMakeCache.txt)" >&2; exit 1; }
+
+echo ">> [$TRIPLE] building"
+ninja -C "$BLD" install >"$BLD/build.log" 2>&1 \
+  || { grep -m20 -E "error|FAILED" "$BLD/build.log" >&2; echo "!! build failed ($BLD/build.log)" >&2; exit 1; }
+
+a=$(find "$OUT" -name 'libclang_rt.builtins*.a' | head -1)
+[[ -n "$a" ]] || { echo "!! no builtins archive under $OUT" >&2; exit 1; }
+for sym in __truncsfbf2 __truncdfbf2 __trunctfbf2 __extendhfsf2 __truncsfhf2 __addtf3 __divti3; do
+  "$NM" "$a" 2>/dev/null | grep -E " T $sym\$" >/dev/null || { echo "!! $a has no $sym" >&2; exit 1; }
+done
+mkdir -p "$DST"
+cp "$a" "$DST/libclang_rt.builtins.a"
+echo ">> [$TRIPLE] builtins -> $DST/libclang_rt.builtins.a"
+
+
+==== curate/darwin.sh === 
+
+#!/usr/bin/env bash
+# Curate a Darwin sysroot from the LOCALLY installed Apple SDK. Never packed
+# into dist/: the SDK license forbids redistribution. Run on a Mac.
+#
+# Layout is SDK-shaped, not flattened: libSystem.tbd re-exports
+# /usr/lib/system/*.dylib by install name and lld resolves those (and
+# frameworks) under -syslibroot, which the linker sets to this root.
+#
+# Ours, not Apple's: libc++/libc++abi (LLVM 22, static, hermetic) replace the
+# SDK's, and compiler-rt TF + bf16 builtins fill what libSystem lacks
+# (binary128, bf16 conversions).
+#
+# Example (from the kairo-sysroots checkout, Kairo cloned at ~/kairo):
+#   OUT=~/kairo/build/arm64-apple-macosx/sysroots ./curate/darwin.sh ~/kairo arm64 x86_64 arm64e
+#
+# Expects <kairo-repo> to hold the LLVM fork source at Lib/llvm-runtimes and
+# its build at build/llvm (Scripts/build_llvm.py). Each triple is staged to
+# $OUT/<triple>; any previous stage of that triple is replaced.
+#
+# build_llvm.py builds the libraries Kairo links, not the clang driver, so
+# build/llvm/bin/clang is usually missing. Build it and the clang++ name the
+# libc++ configure needs, from <kairo-repo>:
+#   ninja -C build/llvm clang && ln -sf clang build/llvm/bin/clang++
+# That clang compiles libc++ and the TF builtins for every arch, so it must
+# carry the fork's __float128 patches for each Darwin target requested; the
+# per-arch check below stops before staging if one is missing.
+#
+# Usage: ./curate/darwin.sh <kairo-repo> [arm64|arm64e|x86_64 ...]
+#   OUT=...         default: <this repo>/staging; each triple lands in OUT/<triple>
+#   SDK=...         default: xcrun --sdk macosx --show-sdk-path
+#   MIN_MACOS=...   default: 11.0 (arm64, arm64e), 10.15 (x86_64)
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+KAIRO="$(cd "${1:?usage: darwin.sh <kairo-repo> [arch...]}" && pwd)"; shift
+ARCHES=("$@"); [[ ${#ARCHES[@]} -eq 0 ]] && ARCHES=(arm64)
+STAGE="${OUT:-$ROOT/staging}"
+WORK="$ROOT/extract/darwin-build"
+
+LLVM_SRC="$KAIRO/Lib/llvm-runtimes"
+LLVM_BIN="$KAIRO/build/llvm/bin"
+CLANG="$LLVM_BIN/clang"; CLANGXX="$LLVM_BIN/clang++"
+
+[[ "$(uname -s)" == Darwin ]]   || { echo "!! run on macOS" >&2; exit 1; }
+SDK="${SDK:-$(xcrun --sdk macosx --show-sdk-path)}"
+SDK="$(cd "$SDK" && pwd -P)"                       # MacOSX.sdk -> MacOSX26.x.sdk
+
+test -x "$CLANG"                || { echo "!! no fork clang at $CLANG" >&2; exit 1; }
+test -f "$SDK/SDKSettings.json" || { echo "!! $SDK is not an SDK" >&2; exit 1; }
+test -d "$LLVM_SRC/runtimes"    || { echo "!! no $LLVM_SRC/runtimes" >&2; exit 1; }
+for t in cmake ninja rsync libtool nm; do
+  command -v $t >/dev/null || { echo "!! need $t" >&2; exit 1; }
+done
+
+# Binary128 needs the fork's HasFloat128 on the Darwin target of EACH arch
+# (DarwinAArch64TargetInfo, DarwinX86_64TargetInfo); without it compiler-rt's
+# int_types.h finds no tf_float and the TF sources compile empty. Checked per
+# arch in the loop, before anything is staged.
+check_float128() {   # $1 = arch, $2 = min
+  "$CLANG" -target "$1-apple-macos$2" -dM -E -x c /dev/null | grep -q __SIZEOF_FLOAT128__ \
+    || { echo "!! fork clang has no __float128 on $1-apple-macos (patch its Darwin TargetInfo first)" >&2; exit 1; }
+}
+
+emit_toml() {
+  cat >"$2" <<EOF
+triple        = "$1"
+llvm_version  = "22.1.0"
+family        = "darwin"
+sysroot       = "."
+resource_dir  = "clang"
+redistributable = false
+include_dirs  = ["usr/include/c++/v1", "usr/include"]
+lib_dirs      = ["usr/lib"]
+has_libcxx    = true
+static        = false
+crt_startup   = []
+crt_end       = []
+libc_link     = ["-lSystem"]
+libcxx_link   = ["-lc++"]
+rtlib         = "compiler-rt"
+linker        = "lld"
+cc_isolation  = ["-nostdlibinc", "-nostdinc++"]
+EOF
+}
+
+stage_sdk() {   # $1 = dst
+  local dst="$1"
+  mkdir -p "$dst/usr" "$dst/System/Library"
+  cp "$SDK/SDKSettings.json" "$dst/"
+  [[ -f "$SDK/SDKSettings.plist" ]] && cp "$SDK/SDKSettings.plist" "$dst/"
+  # Apple's libc++ headers out: ours go in their place.
+  rsync -a --exclude 'c++/' "$SDK/usr/include/" "$dst/usr/include/"
+  # .tbd stubs only; Apple's libc++/libc++abi out (ld64 prefers a dylib/tbd
+  # over our .a in the same dir), swift out.
+  rsync -a --exclude 'swift/' --exclude 'libc++*.tbd' \
+        "$SDK/usr/lib/" "$dst/usr/lib/"
+  rsync -a --exclude '*.swiftmodule' --exclude '*.swiftinterface' \
+        --exclude '*.swiftdoc' --exclude '*.abi.json' \
+        "$SDK/System/Library/Frameworks" "$dst/System/Library/"
+}
+
+build_libcxx() {   # $1 = arch, $2 = min, $3 = dst
+  local arch="$1" min="$2" dst="$3" b="$WORK/libcxx-$arch"
+  rm -rf "$b"
+  cmake -G Ninja -S "$LLVM_SRC/runtimes" -B "$b" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_COMPILER="$CLANG" -DCMAKE_CXX_COMPILER="$CLANGXX" \
+    -DCMAKE_OSX_SYSROOT="$SDK" -DCMAKE_OSX_ARCHITECTURES="$arch" \
+    -DCMAKE_OSX_DEPLOYMENT_TARGET="$min" \
+    -DCMAKE_INSTALL_PREFIX="$dst/usr" \
+    -DLLVM_ENABLE_RUNTIMES="libcxx;libcxxabi" \
+    -DLIBCXX_ENABLE_SHARED=OFF -DLIBCXXABI_ENABLE_SHARED=OFF \
+    -DLIBCXX_ENABLE_STATIC=ON  -DLIBCXXABI_ENABLE_STATIC=ON \
+    -DLIBCXX_STATICALLY_LINK_ABI_IN_STATIC_LIBRARY=ON \
+    -DLIBCXX_HERMETIC_STATIC_LIBRARY=ON \
+    -DLIBCXXABI_USE_LLVM_UNWINDER=OFF \
+    -DLIBCXX_INCLUDE_TESTS=OFF -DLIBCXX_INCLUDE_BENCHMARKS=OFF \
+    -DLIBCXXABI_INCLUDE_TESTS=OFF \
+    -DLIBCXX_INSTALL_LIBRARY_DIR=lib -DLIBCXXABI_INSTALL_LIBRARY_DIR=lib \
+    -DLIBCXX_INSTALL_INCLUDE_DIR=include/c++/v1 \
+    -DLIBCXX_INSTALL_INCLUDE_TARGET_DIR=include/c++/v1
+  ninja -C "$b" install-cxx install-cxxabi
+  # Merged into libc++.a; a separate one would only invite a double link.
+  rm -f "$dst/usr/lib/libc++abi.a"
+}
+
+build_tf_builtins() {   # $1 = arch, $2 = min, $3 = dst
+  local arch="$1" min="$2" dst="$3" b="$WORK/tf-$arch"
+  local B="$LLVM_SRC/compiler-rt/lib/builtins"
+  local srcs
+  srcs=$(sed -n '/^set(GENERIC_TF_SOURCES/,/)/p' "$B/CMakeLists.txt" | grep -oE '[a-z0-9_]+\.c')
+  [[ -n "$srcs" ]] || { echo "!! GENERIC_TF_SOURCES not found" >&2; exit 1; }
+  # bf16 conversions: libSystem exports none, and x86_64 lowers float->bf16
+  # to a __truncsfbf2 libcall (AArch64 happens to expand it inline).
+  local bf
+  bf=$(sed -n '/^set(BF16_SOURCES/,/)/p' "$B/CMakeLists.txt" | grep -oE '[a-z0-9_]+\.c')
+  [[ -n "$bf" ]] || { echo "!! BF16_SOURCES not found" >&2; exit 1; }
+  srcs="$srcs $bf"
+  rm -rf "$b"; mkdir -p "$b" "$dst/clang/lib/darwin"
+  # The TF routines round through __fe_getround / __fe_raise_inexact, which
+  # live in the arch's fp_mode.c (x86_64 shares i386's, as in compiler-rt's
+  # x86_ARCH_SOURCES). libSystem does not export them, so they ship here too.
+  case "$arch" in
+    arm64*) srcs="$srcs aarch64/fp_mode.c" ;;
+    x86_64) srcs="$srcs i386/fp_mode.c" ;;
+  esac
+  for f in $srcs; do
+    "$CLANG" -target "$arch-apple-macos$min" -isysroot "$SDK" \
+      -O2 -fPIC -ffreestanding -fno-builtin -fvisibility=hidden \
+      -c "$B/$f" -o "$b/$(basename "${f%.c}").o"
+  done
+  libtool -static -o "$dst/clang/lib/darwin/libclang_rt.osx.a" "$b"/*.o
+  # No grep -q under pipefail: an early exit SIGPIPEs nm and reads as failure.
+  nm "$dst/clang/lib/darwin/libclang_rt.osx.a" | grep ' T ___addtf3' >/dev/null \
+    || { echo "!! [$arch] TF archive has no ___addtf3" >&2; exit 1; }
+  nm "$dst/clang/lib/darwin/libclang_rt.osx.a" | grep ' T ___fe_getround' >/dev/null \
+    || { echo "!! [$arch] TF archive has no ___fe_getround (fp_mode.c missing)" >&2; exit 1; }
+  nm "$dst/clang/lib/darwin/libclang_rt.osx.a" | grep ' T ___truncsfbf2' >/dev/null \
+    || { echo "!! [$arch] TF archive has no ___truncsfbf2 (bf16 sources missing)" >&2; exit 1; }
+}
+
+for arch in "${ARCHES[@]}"; do
+  case "$arch" in
+    arm64)  min="${MIN_MACOS:-11.0}" ;;
+    # Pointer-authentication ABI (Xcode 26 "Enhanced Security"). The fork's
+    # clang driver turns on the -fptrauth-* set for an arm64e triple, so
+    # libc++ and the TF builtins come out signed with no extra flags here.
+    arm64e) min="${MIN_MACOS:-11.0}" ;;
+    x86_64) min="${MIN_MACOS:-10.15}" ;;
+    *) echo "!! unknown arch $arch" >&2; exit 1 ;;
+  esac
+  check_float128 "$arch" "$min"
+  triple="$arch-apple-macosx"
+  dst="$STAGE/$triple"
+  echo ">> [$triple] staging from $SDK (min $min) -> $dst"
+  rm -rf "$dst"; mkdir -p "$dst" "$WORK"
+  stage_sdk "$dst"
+  build_libcxx "$arch" "$min" "$dst"
+  build_tf_builtins "$arch" "$min" "$dst"
+  emit_toml "$triple" "$dst/SYSROOT.toml"
+
+  test -f "$dst/usr/include/stdio.h"       || { echo "!! [$triple] no stdio.h" >&2; exit 1; }
+  test -f "$dst/usr/include/c++/v1/vector" || { echo "!! [$triple] no libc++ headers" >&2; exit 1; }
+  test -f "$dst/usr/lib/libSystem.tbd"     || { echo "!! [$triple] no libSystem.tbd" >&2; exit 1; }
+  test -d "$dst/usr/lib/system"            || { echo "!! [$triple] no usr/lib/system" >&2; exit 1; }
+  test -f "$dst/usr/lib/libc++.a"          || { echo "!! [$triple] no libc++.a" >&2; exit 1; }
+  if ls "$dst"/usr/lib/libc++*.tbd >/dev/null 2>&1; then
+    echo "!! [$triple] Apple libc++ stub leaked" >&2; exit 1
+  fi
+  echo ">> [$triple] staged ($(du -sh "$dst" | cut -f1))"
+done
+echo "darwin staging complete (local only: never tar-dist / emit-manifest these)."
+
+
+==== curate/decompress-debug.sh === 
+
+#!/usr/bin/env bash
+# Decompress SHF_COMPRESSED debug sections in every .o / .a under staging/<triple>.
+#
+# Alpine's x86 musl-dev (crt*.o, libc.a, libssp_nonshared.a) and FreeBSD's base
+# archives ship .debug_* sections zlib-compressed. A linker reading them must
+# be built with zlib, and an lld without it rejects the whole link:
+#   libc.a(__lock.lo):(.debug_info) is compressed with ELFCOMPRESS_ZLIB,
+#   but lld is not built with zlib support
+# Decompressing costs nothing after xz and makes the sysroot linkable by any
+# lld. The debug info itself is kept: stripping it would lose libc frames in
+# a debugger.
+#
+# Usage: decompress-debug.sh <triple> [<triple> ...]   (default: all in staging/)
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+STAGE="$ROOT/staging"
+OBJCOPY="${LLVM_OBJCOPY:-llvm-objcopy}"
+READOBJ="${LLVM_READOBJ:-llvm-readobj}"
+command -v "$OBJCOPY" >/dev/null || { echo "!! $OBJCOPY not found (set LLVM_OBJCOPY)" >&2; exit 1; }
+command -v "$READOBJ" >/dev/null || { echo "!! $READOBJ not found (set LLVM_READOBJ)" >&2; exit 1; }
+
+# Not `grep -q`: it exits on the first match, readobj takes SIGPIPE on a big
+# archive, and under pipefail the pipeline fails -- reading as "not compressed".
+compressed() { "$READOBJ" -S "$1" 2>/dev/null | grep SHF_COMPRESSED >/dev/null; }
+
+triples=("$@")
+[[ ${#triples[@]} -eq 0 ]] && mapfile -t triples < <(cd "$STAGE" && ls -d */ | tr -d /)
+
+for triple in "${triples[@]}"; do
+  dir="$STAGE/$triple"
+  test -d "$dir" || { echo "!! no staging/$triple" >&2; exit 1; }
+  n=0
+  # -type f: symlinked archives are fixed through their target, once.
+  while IFS= read -r -d '' f; do
+    compressed "$f" || continue
+    # Keep the mtime so the repacked tarball differs only in content.
+    ts=$(stat -c %Y "$f")
+    "$OBJCOPY" --decompress-debug-sections "$f"
+    touch -d "@$ts" "$f"
+    compressed "$f" && { echo "!! [$triple] still compressed: $f" >&2; exit 1; }
+    n=$((n + 1))
+  done < <(find "$dir" -type f \( -name '*.o' -o -name '*.a' \) -print0)
+  echo ">> [$triple] decompressed debug sections in $n file(s)"
+done
+
+
+==== curate/emit-manifest.sh === 
+
+#!/usr/bin/env bash
+# Emit dist/manifest.json: one entry per dist/<triple>-llvm22.tar.xz with its
+# release asset URL, sha256, size, and the family/has_libcxx pulled from the
+# matching staging/<triple>/SYSROOT.toml. This is the file Kairo reads at runtime
+# to pull + verify the right sysroot.
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+STAGE="$ROOT/staging"; DIST="$ROOT/dist"
+# One tag for both the "release" field and every URL: they drifted once
+# (v1-llvm22 URLs in the v2-llvm22 manifest, every one a 404).
+TAG="${KSYS_RELEASE_TAG:-v2-llvm22}"
+BASE="https://github.com/kairolang/kairo-sysroots/releases/download/$TAG"
+OUT="$DIST/manifest.json"
+
+# The compiler-rt bundle is uploaded once and rarely rebuilt; when its tarball
+# is not in dist/, carry the published entry over instead of dropping it.
+prev_rt=$(jq -c '.compiler_rt // empty' "$OUT" 2>/dev/null || true)
+
+tval() { grep -E "^$2[[:space:]]*=" "$1" | head -1 | sed -E 's/^[^=]+=[[:space:]]*//; s/^"//; s/"$//'; }
+
+{
+  echo '{'
+  echo "  \"release\": \"$TAG\","
+  echo '  "llvm_version": "22.1.0",'
+  echo '  "targets": {'
+  first=1
+  for tar in "$DIST"/*-llvm22.tar.xz; do
+    asset=$(basename "$tar")
+    # the compiler-rt bundle is not a per-triple sysroot; handled separately below
+    [[ "$asset" == compiler-rt-* ]] && continue
+    triple=${asset%-llvm22.tar.xz}
+    toml="$STAGE/$triple/SYSROOT.toml"
+    test -f "$toml" || { echo "!! no SYSROOT.toml for $triple" >&2; exit 1; }
+    sha=$(sha256sum "$tar" | cut -d' ' -f1)
+    size=$(stat -c%s "$tar")
+    family=$(tval "$toml" family)
+    has_libcxx=$(tval "$toml" has_libcxx)
+    glibc=$(tval "$toml" glibc_version || true)
+    resdir=$(tval "$toml" resource_dir || true)
+    # TOML string arrays are JSON as written; local_only tells Kairo which dirs
+    # the user must supply (windows-msvc: msvc/, the Microsoft CRT + SDK)
+    local_only=$(grep -E '^local_only[[:space:]]*=' "$toml" | sed -E 's/^[^=]+=[[:space:]]*//' || true)
+    [[ $first -eq 0 ]] && echo ','
+    first=0
+    printf '    "%s": {\n' "$triple"
+    printf '      "asset": "%s",\n' "$asset"
+    printf '      "url": "%s/%s",\n' "$BASE" "$asset"
+    printf '      "sha256": "%s",\n' "$sha"
+    printf '      "size": %s,\n' "$size"
+    printf '      "family": "%s",\n' "$family"
+    # optional keys, comma-joined so the last one carries no trailing comma
+    extra=()
+    [[ -n "$glibc" ]]  && extra+=("$(printf '"glibc_version": "%s"' "$glibc")")
+    [[ -n "$resdir" ]] && extra+=("$(printf '"resource_dir": "%s"' "$resdir")")
+    [[ -n "$local_only" ]] && extra+=("\"local_only\": $local_only")
+    if [[ ${#extra[@]} -gt 0 ]]; then
+      printf '      "has_libcxx": %s,\n' "$has_libcxx"
+      for i in "${!extra[@]}"; do
+        printf '      %s' "${extra[$i]}"
+        [[ $i -lt $((${#extra[@]} - 1)) ]] && printf ','
+        printf '\n'
+      done
+    else
+      printf '      "has_libcxx": %s\n' "$has_libcxx"
+    fi
+    printf '    }'
+  done
+  echo ''
+  echo '  }'
+  # Optional compiler-rt bundle: builtins + crtbegin/crtend for the musl targets.
+  # It is the COMPILER's resource-dir overlay (lib/clang/22/lib/<triple>/...), not
+  # a sysroot Kairo unpacks it into its clang install, not into a sysroot.
+  rt="$DIST/compiler-rt-musl-llvm22.tar.xz"
+  if [[ -f "$rt" ]]; then
+    rtsha=$(sha256sum "$rt" | cut -d' ' -f1)
+    rtsize=$(stat -c%s "$rt")
+    echo '  ,'
+    echo '  "compiler_rt": {'
+    echo '    "linux-musl": {'
+    printf '      "asset": "%s",\n' "$(basename "$rt")"
+    printf '      "url": "%s/%s",\n' "$BASE" "$(basename "$rt")"
+    printf '      "sha256": "%s",\n' "$rtsha"
+    printf '      "size": %s,\n' "$rtsize"
+    echo '      "layout": "lib/clang/22/lib/<triple>/{libclang_rt.builtins.a,clang_rt.crtbegin.o,clang_rt.crtend.o}",'
+    echo '      "applies_to": ["x86_64-linux-musl","aarch64-linux-musl","armv7-linux-musl","i686-linux-musl","riscv64-linux-musl"]'
+    echo '    }'
+    echo '  }'
+  elif [[ -n "$prev_rt" ]]; then
+    echo '  ,'
+    echo "  \"compiler_rt\": $prev_rt"
+  fi
+  echo '}'
+} > "$OUT"
+
+echo ">> wrote $OUT"
+command -v jq >/dev/null 2>&1 && jq -e . "$OUT" >/dev/null && echo ">> manifest.json is valid JSON ($(jq '.targets|length' "$OUT") targets)"
+
+
+==== curate/fetch-glibc.sh === 
+
+#!/usr/bin/env bash
+# Pull Ubuntu 20.04 (focal) glibc + kernel headers for the 5 linux-gnu arches
+# and unpack each into extract/<name>/ as a pristine Ubuntu root (usr/, lib/).
+#
+# Why focal / glibc 2.31: it is the oldest release that ships all five arches.
+# bionic (2.27) has no riscv64, and Debian had no official riscv64 port before
+# trixie. libc++ itself supports glibc >= 2.24, so 2.31 is the floor that
+# works for every target. A binary linked against these stubs runs on any
+# glibc >= 2.31 (Ubuntu 20.04, Debian 11, RHEL 9, Fedora 32 and later).
+#
+# Packages per arch: libc6 (the .so.6 the link resolves against, ld.so),
+# libc6-dev (headers, crt*.o, libc_nonshared.a, the libc.so script),
+# linux-libc-dev (kernel UAPI headers). The newest focal-updates build is
+# taken; symbol versions are fixed at 2.31 across focal updates.
+#
+# Re-runnable: skips a .deb that is already present.
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PULL="$ROOT/ubuntu-pull"
+EXTRACT="$ROOT/extract"
+SUITE=focal
+
+# name | ubuntu arch | mirror
+rows=(
+  "x86_64-linux-gnu-glibc2.31|amd64|http://archive.ubuntu.com/ubuntu"
+  "i686-linux-gnu-glibc2.31|i386|http://archive.ubuntu.com/ubuntu"
+  "aarch64-linux-gnu-glibc2.31|arm64|http://ports.ubuntu.com/ubuntu-ports"
+  "armv7-linux-gnueabihf-glibc2.31|armhf|http://ports.ubuntu.com/ubuntu-ports"
+  "riscv64-linux-gnu-glibc2.31|riscv64|http://ports.ubuntu.com/ubuntu-ports"
+)
+PKGS=(libc6 libc6-dev linux-libc-dev)
+
+# Filename: of the newest version of $3 in a Packages index on stdin.
+pick() {
+  awk -v want="$1" '
+    /^Package: /  { p = $2 }
+    /^Version: /  { v = $2 }
+    /^Filename: / { if (p == want) print v "\t" $2 }
+  ' | sort -V | tail -1 | cut -f2
+}
+
+for row in "${rows[@]}"; do
+  IFS='|' read -r name arch mirror <<<"$row"
+  dir="$PULL/$name"
+  mkdir -p "$dir"
+
+  idx="$dir/Packages"
+  if [[ ! -s "$idx" ]]; then
+    : >"$idx"
+    # updates first: pick() takes the highest version across both indexes.
+    for s in "$SUITE-updates" "$SUITE"; do
+      curl -fsSL --retry 3 "$mirror/dists/$s/main/binary-$arch/Packages.xz" | xz -dc >>"$idx"
+    done
+  fi
+
+  out="$EXTRACT/$name"
+  rm -rf "$out"
+  mkdir -p "$out"
+  for pkg in "${PKGS[@]}"; do
+    rel=$(pick "$pkg" <"$idx")
+    [[ -n "$rel" ]] || { echo "!! [$name] $pkg not in $SUITE/$arch" >&2; exit 1; }
+    deb="$dir/$(basename "$rel")"
+    if [[ ! -f "$deb" ]]; then
+      echo ">> [$name] downloading $(basename "$rel")"
+      curl -fsSL --retry 3 -o "$deb" "$mirror/$rel"
+    fi
+    echo "$mirror/$rel" >>"$dir/urls.txt"
+    dpkg-deb -x "$deb" "$out"
+  done
+  sort -u -o "$dir/urls.txt" "$dir/urls.txt"
+
+  test -f "$out/usr/include/stdio.h" || { echo "!! [$name] no stdio.h" >&2; exit 1; }
+  echo ">> [$name] extracted -> $out"
+done
+
+
+==== curate/fetch-musl-compiler-rt.sh === 
+
+#!/usr/bin/env bash
+# Pull Alpine's compiler-rt (LLVM 22.1.3-r0) for each musl arch and stage the
+# three pieces a link actually needs builtins + crtbegin + crtend into a
+# clang resource-dir tree:
+#
+#   compiler-rt/lib/clang/22/lib/<normalized-triple>/{libclang_rt.builtins.a,
+#                                                     clang_rt.crtbegin.o,
+#                                                     clang_rt.crtend.o}
+#
+# This is the per-target runtime layout clang 22 prefers (no -<arch> suffix). It
+# is the COMPILER's resource dir, NOT a sysroot it ships with the Kairo clang.
+# The sanitizer/xray/profile archives in the apk are dropped (not needed to link).
+#
+# Re-runnable: skips download if the apk is already present.
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VER="22.1.3-r0"
+BASE="https://dl-cdn.alpinelinux.org/alpine/edge/main"
+RES="$ROOT/staging/compiler-rt-musl/lib/clang/22/lib"
+
+# kairo-triple -> (alpine arch dir, alpine internal triple, normalized clang triple)
+rows=(
+  "x86_64-linux-musl|x86_64|x86_64-alpine-linux-musl|x86_64-unknown-linux-musl"
+  "aarch64-linux-musl|aarch64|aarch64-alpine-linux-musl|aarch64-unknown-linux-musl"
+  "armv7-linux-musl|armv7|armv7-alpine-linux-musleabihf|armv7-unknown-linux-musl"
+  "i686-linux-musl|x86|i586-alpine-linux-musl|i686-unknown-linux-musl"
+  "riscv64-linux-musl|riscv64|riscv64-alpine-linux-musl|riscv64-unknown-linux-musl"
+)
+
+rm -rf "$ROOT/staging/compiler-rt-musl"
+for row in "${rows[@]}"; do
+  IFS='|' read -r triple arch atriple ntriple <<<"$row"
+  apk="compiler-rt-${VER}.apk"
+  dest="$ROOT/alpine-pull/$triple/$apk"
+  mkdir -p "$(dirname "$dest")"
+  if [[ ! -f "$dest" ]]; then
+    echo ">> [$triple] downloading $apk"
+    curl -fsSL --retry 3 -o "$dest" "$BASE/$arch/$apk"
+  else
+    echo ">> [$triple] $apk already present"
+  fi
+
+  tmp="$(mktemp -d)"
+  # apk = gzip tar with PAX APK-TOOLS.checksum keywords -> filter the warning noise
+  tar -xz -C "$tmp" -f "$dest" 2>&1 | grep -v 'APK-TOOLS.checksum' || true
+  asrc="$tmp/usr/lib/llvm22/lib/clang/22/lib/$atriple"
+
+  out="$RES/$ntriple"
+  mkdir -p "$out"
+  cp -a "$asrc/libclang_rt.builtins-$arch.a" "$out/libclang_rt.builtins.a" 2>/dev/null \
+    || cp -a "$asrc"/libclang_rt.builtins-*.a "$out/libclang_rt.builtins.a"
+  cp -a "$asrc"/clang_rt.crtbegin-*.o "$out/clang_rt.crtbegin.o"
+  cp -a "$asrc"/clang_rt.crtend-*.o   "$out/clang_rt.crtend.o"
+  rm -rf "$tmp"
+
+  test -f "$out/libclang_rt.builtins.a" || { echo "!! [$triple] no builtins" >&2; exit 1; }
+  test -f "$out/clang_rt.crtbegin.o"    || { echo "!! [$triple] no crtbegin" >&2; exit 1; }
+  test -f "$out/clang_rt.crtend.o"      || { echo "!! [$triple] no crtend" >&2; exit 1; }
+  echo ">> [$triple] staged builtins+crt -> lib/clang/22/lib/$ntriple"
+done
+echo "compiler-rt staging complete -> $ROOT/staging/compiler-rt-musl"
+
+
+==== curate/fetch-musl-libcxx.sh === 
+
+#!/usr/bin/env bash
+# Pull libc++-dev (headers) for each musl arch and graft the c++/v1 headers into
+# the already-extracted musl trees. The libc++-static apk we already had shipped
+# only archives (no headers) -> this fixes that blocker.
+#
+# Re-runnable: skips download if the apk is already present, re-extracts headers.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VER="22.1.3-r0"
+BASE="https://dl-cdn.alpinelinux.org/alpine/edge/main"
+
+# triple -> alpine arch dir name
+declare -A ARCH=(
+  [x86_64-linux-musl]=x86_64
+  [aarch64-linux-musl]=aarch64
+  [armv7-linux-musl]=armv7
+  [i686-linux-musl]=x86
+  [riscv64-linux-musl]=riscv64
+)
+
+for triple in "${!ARCH[@]}"; do
+  arch="${ARCH[$triple]}"
+  apk="libc++-dev-${VER}.apk"
+  dest="$ROOT/alpine-pull/$triple/$apk"
+  tree="$ROOT/extract/$triple"
+
+  if [[ ! -f "$dest" ]]; then
+    echo ">> [$triple] downloading $apk"
+    curl -fsSL --retry 3 -o "$dest" "$BASE/$arch/$apk"
+  else
+    echo ">> [$triple] $apk already present, skipping download"
+  fi
+
+  # Extract ONLY the c++ headers. The apk also carries usr/lib/libc++.so and
+  # libc++abi.so, but those are GNU ld INPUT() scripts that pull the *shared*
+  # libs; musl targets are static, and we already have libc++.a/.a archives, so
+  # we deliberately drop them.
+  echo ">> [$triple] extracting headers into usr/include/c++"
+  rm -rf "$tree/usr/include/c++"
+  # apk is a gzip'd tar with PAX 'APK-TOOLS.checksum.SHA1' keywords GNU tar warns
+  # about; filter that noise but keep real errors.
+  tar -xz -C "$tree" -f "$dest" usr/include/c++ 2>&1 \
+    | grep -v 'APK-TOOLS.checksum' || true
+
+  # Verify
+  for h in vector string stdexcept; do
+    test -f "$tree/usr/include/c++/v1/$h" \
+      || { echo "!! [$triple] MISSING header $h" >&2; exit 1; }
+  done
+  echo ">> [$triple] OK: c++/v1/{vector,string,stdexcept} present"
+done
+
+echo "All 5 musl arches now have libc++ headers."
+
+
+==== curate/freebsd.sh === 
+
+#!/usr/bin/env bash
+# Curate the 2 FreeBSD sysroots. Unlike musl/mingw we DO NOT flatten to
+# include/+lib/: FreeBSD's usr/lib is full of `../../lib/<x>.so.N` relative
+# symlinks. Preserving the usr/include + usr/lib + lib split at the same depth
+# under <triple>/ keeps every relative symlink resolving correctly with zero
+# rewriting (usr/lib/foo -> ../../lib/bar  resolves to <triple>/lib/bar).
+#
+# This stages the base system only and writes a C-only SYSROOT.toml
+# (has_libcxx = false, base libgcc). build-bsd-runtimes.sh then adds LLVM 22
+# libc++/libc++abi/libunwind (libcxx/) and compiler-rt builtins
+# (compiler-rt/lib/freebsd/) built from Kairo's LLVM, and rewrites the TOML.
+# Base libc++ is 19 on libcxxrt, not the libc++ 22 every other target uses.
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+STAGE="$ROOT/staging"
+
+declare -A SRC=(
+  [x86_64-unknown-freebsd]=x86_64-unknown-freebsd
+  [aarch64-unknown-freebsd]=aarch64-unknown-freebsd
+)
+
+emit_toml() {
+  local triple="$1" out="$2"
+  cat >"$out" <<EOF
+triple        = "$triple"
+llvm_version  = "22.1.0"
+family        = "freebsd"
+sysroot       = "."
+include_dirs  = ["usr/include"]
+lib_dirs      = ["usr/lib", "lib"]
+has_libcxx    = false
+static        = false
+crt_startup   = ["crt1.o", "crti.o"]
+crt_end       = ["crtn.o"]
+libc_link     = ["-lc"]
+libcxx_link   = []
+rtlib         = "libgcc"
+linker        = "lld"
+cc_isolation  = ["-nostdlibinc"]
+EOF
+}
+
+for triple in "${!SRC[@]}"; do
+  src="$ROOT/extract/${SRC[$triple]}"
+  dst="$STAGE/$triple"
+  echo ">> [$triple] staging (preserving usr/lib + lib split)"
+  test -f "$src/usr/lib/crt1.o" || { echo "!! [$triple] no crt1.o" >&2; exit 1; }
+  rm -rf "$dst"; mkdir -p "$dst/usr"
+  cp -a "$src/usr/include" "$dst/usr/include"
+  cp -a "$src/usr/lib"     "$dst/usr/lib"
+  cp -a "$src/lib"         "$dst/lib"
+  emit_toml "$triple" "$dst/SYSROOT.toml"
+  test -f "$dst/usr/include/stdio.h" || { echo "!! [$triple] no stdio.h" >&2; exit 1; }
+  test -f "$dst/usr/lib/libc.a"      || { echo "!! [$triple] no libc.a" >&2; exit 1; }
+  echo ">> [$triple] staged -> $dst"
+done
+echo "freebsd staging complete."
+
+
+==== curate/glibc.sh === 
+
+#!/usr/bin/env bash
+# Curate the 5 linux-gnu sysroots (glibc 2.31, libc++) into canonical
+# staging/<name>/{include,lib,compiler-rt} and write SYSROOT.toml. Inputs:
+# extract/<name> from fetch-glibc.sh, runtimes-out/<name> from
+# build-glibc-runtimes.sh. Tarballs are produced by tar-dist.sh, not here.
+#
+# Canonical mapping:
+#   usr/include/*                    -> include/     (multiarch subdir kept:
+#                                                     include/<multiarch>/)
+#   lib/<ma>/*, usr/lib/<ma>/*       -> lib/         (flat; files only)
+#   runtimes include/c++/v1          -> include/c++/v1
+#   runtimes libc++/abi/unwind .a    -> lib/
+#   runtimes builtins + crtbegin/end -> compiler-rt/lib/<triple>/
+#
+# glibc is linked dynamically: the .so.6 files here are what the link
+# resolves symbol versions against, and the target machine supplies the real
+# ones. libc++ is static, so the binary needs nothing else.
+#
+# Ubuntu's libc.so / libm.so linker scripts and its dev symlinks name
+# absolute paths (/lib/<ma>/libc.so.6). lld re-roots those under --sysroot,
+# which this flat layout does not have, so both are rewritten to bare names;
+# lld finds a bare name in a script through the -L search path.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+STAGE="$ROOT/staging"
+GLIBC=2.31
+
+triple_of() { echo "${1%-glibc*}"; }
+
+emit_toml() {
+  local triple="$1" ma="$2" out="$3"
+  cat >"$out" <<EOF
+triple        = "$triple"
+llvm_version  = "22.1.0"
+family        = "linux-gnu"
+glibc_version = "$GLIBC"
+sysroot       = "."
+include_dirs  = ["include/c++/v1", "include/$ma", "include"]
+lib_dirs      = ["lib"]
+has_libcxx    = true
+static        = false
+crt_startup   = ["crt1.o", "crti.o"]
+crt_end       = ["crtn.o"]
+libc_link     = ["-lm", "-lpthread", "-ldl", "-lc"]
+libcxx_link   = ["-lc++", "-lc++abi", "-lunwind"]
+rtlib         = "compiler-rt"
+unwindlib     = "libunwind"
+linker        = "lld"
+resource_dir  = "compiler-rt"
+cc_isolation  = ["-nostdlibinc", "-nostdinc++"]
+EOF
+}
+
+names=("$@")
+[[ ${#names[@]} -eq 0 ]] && mapfile -t names < <(cd "$ROOT/extract" && ls -d *-glibc*/ | tr -d /)
+
+for name in "${names[@]}"; do
+  src="$ROOT/extract/$name"
+  rt="$ROOT/runtimes-out/$name"
+  dst="$STAGE/$name"
+  triple=$(triple_of "$name")
+  test -f "$rt/lib/libc++.a" || { echo "!! [$name] no runtimes; run build-glibc-runtimes.sh" >&2; exit 1; }
+
+  # The multiarch dir is the one holding crt1.o (arm-linux-gnueabihf for
+  # armv7, i386-linux-gnu for i686).
+  ma=$(cd "$src/usr/lib" && dirname */crt1.o)
+  echo ">> [$name] staging (multiarch $ma)"
+
+  rm -rf "$dst"
+  mkdir -p "$dst/include" "$dst/lib" "$dst/compiler-rt/lib/$triple"
+
+  cp -a "$src/usr/include/." "$dst/include/"
+  cp -a "$rt/include/c++" "$dst/include/"
+
+  # Files and links only: gconv/, audit/ and friends are runtime data, not
+  # link inputs.
+  for d in "$src/lib/$ma" "$src/usr/lib/$ma"; do
+    find "$d" -maxdepth 1 \( -type f -o -type l \) -exec cp -a {} "$dst/lib/" \;
+  done
+  cp -a "$rt/lib/libc++.a" "$rt/lib/libc++abi.a" "$rt/lib/libunwind.a" "$rt/lib/libc++experimental.a" "$dst/lib/"
+  cp -a "$rt/rt/." "$dst/compiler-rt/lib/$triple/"
+
+  # Absolute symlinks -> bare names in the same flat dir.
+  while IFS= read -r -d '' l; do
+    t=$(readlink "$l")
+    [[ "$t" == /* ]] || continue
+    b=$(basename "$t")
+    test -e "$dst/lib/$b" || { echo "!! [$name] $(basename "$l") -> $t: no $b" >&2; exit 1; }
+    ln -sfn "$b" "$l"
+  done < <(find "$dst/lib" -type l -print0)
+
+  # Linker scripts: every absolute path -> its basename.
+  for s in "$dst"/lib/*.so; do
+    [[ -f "$s" && ! -L "$s" ]] || continue
+    grep -q "^GROUP\|^INPUT\|OUTPUT_FORMAT" "$s" 2>/dev/null || continue
+    # Paths only: a slash then a name, so the /* ... */ comments survive.
+    sed -i -E 's#/[A-Za-z0-9_.+-]+(/[A-Za-z0-9_.+-]+)*/([A-Za-z0-9_.+-]+)#\2#g' "$s"
+  done
+
+  emit_toml "$triple" "$ma" "$dst/SYSROOT.toml"
+
+  # sanity
+  for f in include/c++/v1/vector include/stdio.h "include/$ma/bits/wordsize.h" \
+           lib/crt1.o lib/crti.o lib/crtn.o lib/libc.so lib/libc.so.6 lib/libc_nonshared.a \
+           lib/libc++.a "compiler-rt/lib/$triple/libclang_rt.builtins.a"; do
+    test -e "$dst/$f" || { echo "!! [$name] missing $f" >&2; exit 1; }
+  done
+  if grep -hE "^(GROUP|INPUT).*/[A-Za-z]" "$dst"/lib/*.so 2>/dev/null | grep -q .; then
+    echo "!! [$name] a linker script still names an absolute path" >&2; exit 1
+  fi
+  echo ">> [$name] staged -> $dst"
+  grep GROUP "$dst/lib/libc.so"
+done
+
+echo "glibc staging complete."
+
+
+==== curate/mingw.sh === 
+
+#!/usr/bin/env bash
+# Curate the 4 windows-gnu (llvm-mingw) sysroots into staging/<triple>/{include,lib}.
+# Source dirs are already include/+lib/ shaped per arch; we just copy and write TOML.
+#
+# crtbegin/crtend ARE shipped in the mingw sysroot lib/ (unlike musl, where they
+# come from compiler-rt). compiler-rt builtins themselves still come from the
+# compiler (llvm-mingw bundles them at lib/clang/22/lib/windows, outside the
+# per-arch sysroot). Here they live in the sysroot instead: build-builtins.sh
+# builds them from Kairo's LLVM into compiler-rt/lib/windows/ (resource_dir).
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+STAGE="$ROOT/staging"
+M="$ROOT/extract/mingw/llvm-mingw-20260224-ucrt-ubuntu-22.04-x86_64"
+
+# kairo-triple -> mingw arch dir
+declare -A SRC=(
+  [x86_64-windows-gnu]=x86_64-w64-mingw32
+  [aarch64-windows-gnu]=aarch64-w64-mingw32
+  [armv7-windows-gnu]=armv7-w64-mingw32
+  [i686-windows-gnu]=i686-w64-mingw32
+)
+
+emit_toml() {
+  local triple="$1" out="$2"
+  cat >"$out" <<EOF
+triple        = "$triple"
+llvm_version  = "22.1.0"
+family        = "windows-gnu"
+sysroot       = "."
+include_dirs  = ["include/c++/v1", "include"]
+lib_dirs      = ["lib"]
+has_libcxx    = true
+static        = true
+crt_startup   = ["crt2.o", "crtbegin.o"]
+crt_end       = ["crtend.o"]
+libc_link     = ["-lmingw32", "-lmoldname", "-lmingwex", "-lmsvcrt", "-ladvapi32", "-lshell32", "-luser32", "-lkernel32"]
+libcxx_link   = ["-lc++", "-lunwind"]
+rtlib         = "compiler-rt"
+unwindlib     = "libunwind"
+linker        = "lld"
+resource_dir  = "compiler-rt"
+cc_isolation  = ["-nostdlibinc", "-nostdinc++"]
+EOF
+}
+
+for triple in "${!SRC[@]}"; do
+  src="$M/${SRC[$triple]}"
+  dst="$STAGE/$triple"
+  echo ">> [$triple] staging from ${SRC[$triple]}"
+  test -d "$src/include/c++/v1" || { echo "!! [$triple] no libc++ headers" >&2; exit 1; }
+  rm -rf "$dst"; mkdir -p "$dst/include" "$dst/lib"
+  cp -a "$src/include/." "$dst/include/"
+  cp -a "$src/lib/."     "$dst/lib/"
+  emit_toml "$triple" "$dst/SYSROOT.toml"
+  test -f "$dst/lib/crt2.o"   || { echo "!! [$triple] no crt2.o" >&2; exit 1; }
+  test -f "$dst/lib/libc++.a" || { echo "!! [$triple] no libc++.a" >&2; exit 1; }
+  echo ">> [$triple] staged -> $dst"
+done
+echo "mingw staging complete."
+
+
+==== curate/msvc.sh === 
+
+#!/usr/bin/env bash
+# Curate the windows-msvc sysroots (x86_64, aarch64 a.k.a. arm64, i686 a.k.a.
+# i386) from an xwin splat of the Microsoft CRT + Windows SDK, plus our own
+# libc++ and compiler-rt builtins built against it.
+#
+# Two layers, one directory:
+#   staging/<triple>/msvc/                 Microsoft CRT + SDK (xwin splat).
+#                                          LOCAL ONLY: the license forbids
+#                                          redistribution. SYSROOT.toml lists it
+#                                          in local_only, and tar-dist.sh
+#                                          excludes it from every tarball.
+#   staging/<triple>/include/c++/v1, lib/, compiler-rt/
+#                                          Ours (LLVM 22, Apache-2.0 WITH
+#                                          LLVM-exception); safe to ship.
+#
+# Header order matters: include/c++/v1, then clang's resource headers, then
+# the CRT/SDK dirs (where clang-cl puts -imsvc). The UCRT's stddef.h lacks
+# max_align_t, and searched before clang's it hides the one libc++ needs.
+# Kairo's C interop already orders include_dirs that way (c++ dirs, resource
+# dir, the rest). libc_link / libcxx_link are lld-link inputs, as Kairo's COFF
+# flavor passes them. static = true means the static CRT, not -static.
+#
+# Static CRT (/MT: libcmt + libvcruntime + libucrt): a Kairo binary needs no
+# vcruntime140.dll / VC++ redistributable on the target. libc++ uses the
+# vcruntime ABI (exceptions/RTTI come from vcruntime), so there is no
+# libc++abi or libunwind here.
+#
+# libc++ is compiled with _CRT_STDIO_ISO_WIDE_SPECIFIERS, and the UCRT stamps
+# every object with /failifmismatch on it: every TU linked against this
+# sysroot must define it too (SYSROOT.toml cc_defines), or lld-link refuses.
+#
+# The splat comes from xwin, run by whoever accepts Microsoft's license:
+#   xwin --accept-license --arch x86_64,aarch64,x86 \
+#        --cache-dir extract/xwin-cache splat --output extract/xwin
+#
+# Expects <kairo-repo> to hold the LLVM fork source at Lib/llvm-runtimes and
+# the fork's clang-cl + lld-link at build/llvm/bin.
+#
+# Binary128 needs the fork's __float128 on each *-windows-msvc triple;
+# without it compiler-rt's int_types.h finds no tf_float and the quad-float
+# (TF) routines compile empty, so Kairo's f128 would not link. Checked per
+# arch before anything is staged, and the built archive must define __addtf3.
+#
+# Usage: ./curate/msvc.sh <kairo-repo> [x86_64|aarch64|arm64|i686|i386 ...]
+#   XWIN=...  splat dir (default: <this repo>/extract/xwin)
+#   OUT=...   default: <this repo>/staging; each triple lands in OUT/<triple>
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+KAIRO="$(cd "${1:?usage: msvc.sh <kairo-repo> [arch...]}" && pwd)"; shift
+ARCHES=("$@"); [[ ${#ARCHES[@]} -eq 0 ]] && ARCHES=(x86_64 aarch64 i686)
+XWIN="$(cd "${XWIN:-$ROOT/extract/xwin}" && pwd)"
+STAGE="${OUT:-$ROOT/staging}"
+WORK="$ROOT/runtimes-build/msvc"
+
+LLVM_SRC="$KAIRO/Lib/llvm-runtimes"
+LLVM_BIN="$KAIRO/build/llvm/bin"
+CLANG="$LLVM_BIN/clang"; CLANG_CL="$LLVM_BIN/clang-cl"; LLD_LINK="$LLVM_BIN/lld-link"
+
+test -x "$CLANG_CL"                     || { echo "!! no fork clang-cl at $CLANG_CL" >&2; exit 1; }
+test -x "$LLD_LINK"                     || { echo "!! no fork lld-link at $LLD_LINK" >&2; exit 1; }
+test -d "$LLVM_SRC/runtimes"            || { echo "!! no $LLVM_SRC/runtimes" >&2; exit 1; }
+test -f "$XWIN/sdk/include/um/Windows.h" || { echo "!! $XWIN is not an xwin splat (run xwin splat first)" >&2; exit 1; }
+# The fork builds no llvm-lib/rc/mt; any LLVM 22 host copy does the same job.
+tool() { if [[ -x "$LLVM_BIN/$1" ]]; then echo "$LLVM_BIN/$1"; else command -v "$1" || { echo "!! need $1" >&2; exit 1; }; fi; }
+LLVM_LIB=$(tool llvm-lib); LLVM_RC=$(tool llvm-rc); LLVM_MT=$(tool llvm-mt); LLVM_NM=$(tool llvm-nm)
+for t in cmake ninja; do command -v $t >/dev/null || { echo "!! need $t" >&2; exit 1; }; done
+
+# <triple> <xwin-arch>  ->  SYSROOT.toml
+emit_toml() {
+  local triple="$1" xa="$2"
+  cat >"$3" <<EOF
+triple        = "$triple"
+llvm_version  = "22.1.0"
+family        = "windows-msvc"
+sysroot       = "."
+include_dirs  = ["include/c++/v1", "msvc/crt/include", "msvc/sdk/include/ucrt", "msvc/sdk/include/um", "msvc/sdk/include/shared"]
+lib_dirs      = ["lib", "msvc/crt/lib/$xa", "msvc/sdk/lib/um/$xa", "msvc/sdk/lib/ucrt/$xa"]
+has_libcxx    = true
+static        = true
+crt_startup   = []
+crt_end       = []
+libc_link     = ["libcmt.lib", "libvcruntime.lib", "libucrt.lib", "oldnames.lib", "kernel32.lib", "user32.lib", "advapi32.lib", "shell32.lib", "uuid.lib"]
+libcxx_link   = ["libc++.lib"]
+rtlib         = "compiler-rt"
+linker        = "lld-link"
+resource_dir  = "compiler-rt"
+msvc_crt      = "static"
+local_only    = ["msvc"]
+cc_defines    = ["_CRT_STDIO_ISO_WIDE_SPECIFIERS"]
+cc_isolation  = ["-nostdlibinc", "-nostdinc++"]
+EOF
+}
+
+# Microsoft's half: headers for every arch, libs for this arch only. cp -a
+# keeps xwin's case-variant symlinks (Windows.h -> windows.h), which is what
+# lets the SDK's mixed-case #includes resolve on a case-sensitive filesystem.
+stage_msvc() {   # $1 = xwin arch, $2 = dst
+  local xa="$1" m="$2/msvc"
+  mkdir -p "$m/crt/lib" "$m/sdk/include" "$m/sdk/lib/um" "$m/sdk/lib/ucrt"
+  cp -a "$XWIN/crt/include"             "$m/crt/"
+  cp -a "$XWIN/crt/lib/$xa"             "$m/crt/lib/"
+  for d in ucrt um shared winrt; do
+    [[ -d "$XWIN/sdk/include/$d" ]] && cp -a "$XWIN/sdk/include/$d" "$m/sdk/include/"
+  done
+  cp -a "$XWIN/sdk/lib/um/$xa"          "$m/sdk/lib/um/"
+  cp -a "$XWIN/sdk/lib/ucrt/$xa"        "$m/sdk/lib/ucrt/"
+}
+
+build_runtimes() {   # $1 = triple, $2 = xwin arch, $3 = dst
+  local triple="$1" xa="$2" dst="$3" b="$WORK/$1" out="$WORK/$1-out" m="$3/msvc"
+  local inc="-imsvc $m/crt/include -imsvc $m/sdk/include/ucrt -imsvc $m/sdk/include/um -imsvc $m/sdk/include/shared"
+  # COMPILER_RT_ENABLE_SOFTWARE_INT128 adds -fforce-enable-int128, which
+  # clang-cl ignores ("unknown argument"): on i686 the __int128 and quad-float
+  # routines then compile empty. Pass it in the spelling clang-cl forwards.
+  # A no-op on the 64-bit targets, where __int128 is native.
+  inc="$inc -Xclang -fforce-enable-int128"
+  local libp="/libpath:$m/crt/lib/$xa /libpath:$m/sdk/lib/um/$xa /libpath:$m/sdk/lib/ucrt/$xa"
+  rm -rf "$b" "$out"; mkdir -p "$b"
+  echo ">> [$triple] configuring runtimes"
+  # ClangClCMakeCompileRules: '-' flag spelling, so clang-cl never mistakes a
+  # /mnt/... path for a /m option. try_compile stays compile-only (no libc++
+  # or builtins to link until this build makes them).
+  cmake -G Ninja -S "$LLVM_SRC/runtimes" -B "$b" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX="$out" \
+    -DCMAKE_SYSTEM_NAME=Windows -DCMAKE_SYSTEM_VERSION=10.0 \
+    -DCMAKE_USER_MAKE_RULES_OVERRIDE="$LLVM_SRC/llvm/cmake/platforms/ClangClCMakeCompileRules.cmake" \
+    -DCMAKE_C_COMPILER="$CLANG_CL" -DCMAKE_CXX_COMPILER="$CLANG_CL" \
+    -DCMAKE_ASM_COMPILER="$CLANG_CL" \
+    -DCMAKE_C_COMPILER_TARGET="$triple" -DCMAKE_CXX_COMPILER_TARGET="$triple" \
+    -DCMAKE_ASM_COMPILER_TARGET="$triple" \
+    -DCMAKE_LINKER="$LLD_LINK" -DCMAKE_AR="$LLVM_LIB" \
+    -DCMAKE_RC_COMPILER="$LLVM_RC" -DCMAKE_MT="$LLVM_MT" \
+    -DCMAKE_C_FLAGS="$inc" -DCMAKE_CXX_FLAGS="$inc" -DCMAKE_ASM_FLAGS="$inc" \
+    -DCMAKE_EXE_LINKER_FLAGS="$libp" -DCMAKE_SHARED_LINKER_FLAGS="$libp" \
+    -DCMAKE_C_STANDARD_LIBRARIES="" -DCMAKE_CXX_STANDARD_LIBRARIES="" \
+    -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+    -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded \
+    -DLLVM_ENABLE_RUNTIMES="compiler-rt;libcxx" \
+    -DLLVM_DEFAULT_TARGET_TRIPLE="$triple" \
+    -DLLVM_ENABLE_PER_TARGET_RUNTIME_DIR=OFF \
+    -DLLVM_INCLUDE_TESTS=OFF \
+    -DCOMPILER_RT_DEFAULT_TARGET_ONLY=ON \
+    -DCOMPILER_RT_BUILD_BUILTINS=ON \
+    -DCOMPILER_RT_ENABLE_SOFTWARE_INT128=ON \
+    -DCOMPILER_RT_BUILD_CRT=OFF \
+    -DCOMPILER_RT_BUILD_SANITIZERS=OFF \
+    -DCOMPILER_RT_BUILD_XRAY=OFF \
+    -DCOMPILER_RT_BUILD_LIBFUZZER=OFF \
+    -DCOMPILER_RT_BUILD_PROFILE=OFF \
+    -DCOMPILER_RT_BUILD_MEMPROF=OFF \
+    -DCOMPILER_RT_BUILD_ORC=OFF \
+    -DCOMPILER_RT_BUILD_CTX_PROFILE=OFF \
+    -DCOMPILER_RT_INCLUDE_TESTS=OFF \
+    -DLIBCXX_CXX_ABI=vcruntime \
+    -DLIBCXX_ENABLE_SHARED=OFF -DLIBCXX_ENABLE_STATIC=ON \
+    -DLIBCXX_INCLUDE_TESTS=OFF -DLIBCXX_INCLUDE_BENCHMARKS=OFF \
+    >"$b/configure.log" 2>&1 \
+    || { tail -30 "$b/configure.log" >&2; echo "!! [$triple] configure failed ($b/configure.log)" >&2; exit 1; }
+
+  echo ">> [$triple] building"
+  ninja -C "$b" install >"$b/build.log" 2>&1 \
+    || { grep -m20 -E "error|FAILED" "$b/build.log" >&2; echo "!! [$triple] build failed ($b/build.log)" >&2; exit 1; }
+
+  local cxx rt
+  cxx=$(find "$out" -name 'libc++.lib' | head -1)
+  rt=$(find "$out" -name 'clang_rt.builtins*.lib' | head -1)
+  [[ -n "$cxx" && -n "$rt" ]] || { echo "!! [$triple] runtimes incomplete" >&2; exit 1; }
+  mkdir -p "$dst/include" "$dst/lib" "$dst/compiler-rt/lib/windows"
+  cp -a "$out/include/c++" "$dst/include/"
+  cp "$cxx" "$dst/lib/libc++.lib"
+  cp "$rt"  "$dst/compiler-rt/lib/windows/$(basename "$rt")"
+  # grep reads to EOF (no -q): an early exit would SIGPIPE the producer and
+  # pipefail would turn a match into a failure.
+  add_tf_compare_aliases "$triple" "$dst/compiler-rt/lib/windows/$(basename "$rt")" "$b"
+  rt="$dst/compiler-rt/lib/windows/$(basename "$rt")"
+  for sym in __addtf3 __trunctfbf2 __truncsfbf2; do
+    "$LLVM_NM" "$rt" 2>/dev/null | grep -E " T _?$sym\$" >/dev/null \
+      || { echo "!! [$triple] builtins have no $sym (TF/bf16 routines compiled empty)" >&2; exit 1; }
+  done
+  grep -q '_LIBCPP_DISABLE_VISIBILITY_ANNOTATIONS' "$dst/include/c++/v1/__config_site" \
+    || { echo "!! [$triple] __config_site is not static-only (would import __imp_ symbols)" >&2; exit 1; }
+}
+
+# comparetf2.c defines __letf2 / __getf2 and makes __eqtf2, __lttf2, __netf2,
+# __gttf2 (and __cmptf2) aliases of them. COMPILER_RT_ALIAS expands to nothing
+# on _WIN32 (COFF has no symbol aliases), so on these targets those names do
+# not exist and any f128 comparison fails to link (undefined __netf2). Add
+# them as forwarding functions, built with the same headers so CMP_RESULT and
+# fp_t match, into the builtins archive.
+add_tf_compare_aliases() {   # $1 = triple, $2 = builtins .lib (rewritten), $3 = build dir
+  local triple="$1" lib="$2" w="$3/tf-compare-aliases"
+  local B="$LLVM_SRC/compiler-rt/lib/builtins"
+  mkdir -p "$w"
+  cat >"$w/tf_compare_aliases.c" <<'EOC'
+#define QUAD_PRECISION
+#include "fp_lib.h"
+#if defined(CRT_HAS_TF_MODE)
+#include "fp_compare_impl.inc"
+COMPILER_RT_ABI CMP_RESULT __letf2(fp_t a, fp_t b);
+COMPILER_RT_ABI CMP_RESULT __getf2(fp_t a, fp_t b);
+COMPILER_RT_ABI CMP_RESULT __cmptf2(fp_t a, fp_t b) { return __letf2(a, b); }
+COMPILER_RT_ABI CMP_RESULT __eqtf2(fp_t a, fp_t b) { return __letf2(a, b); }
+COMPILER_RT_ABI CMP_RESULT __lttf2(fp_t a, fp_t b) { return __letf2(a, b); }
+COMPILER_RT_ABI CMP_RESULT __netf2(fp_t a, fp_t b) { return __letf2(a, b); }
+COMPILER_RT_ABI CMP_RESULT __gttf2(fp_t a, fp_t b) { return __getf2(a, b); }
+#else
+#error "no TF mode: __float128 / int128 missing on this target"
+#endif
+EOC
+  # $inc: build_runtimes' CRT/SDK -imsvc flags (and -fforce-enable-int128)
+  # shellcheck disable=SC2086
+  "$CLANG_CL" --target="$triple" /nologo /c /O2 /MT $inc -I"$B" \
+    "$w/tf_compare_aliases.c" /Fo"$w/tf_compare_aliases.obj"
+  "$LLVM_LIB" /nologo /out:"$w/merged.lib" "$lib" "$w/tf_compare_aliases.obj"
+  mv "$w/merged.lib" "$lib"
+  for sym in __eqtf2 __netf2 __lttf2 __gttf2 __cmptf2; do
+    "$LLVM_NM" "$lib" 2>/dev/null | grep -E " T _?$sym\$" >/dev/null \
+      || { echo "!! [$triple] builtins still have no $sym" >&2; exit 1; }
+  done
+}
+
+# The validated Kairo-shaped link: GNU-style clang driver, sysroot dirs only,
+# C++ with a thrown and caught exception, linked by lld-link. Then the same
+# link replayed from SYSROOT.toml alone.
+validate() {   # $1 = triple, $2 = xwin arch, $3 = dst
+  local triple="$1" xa="$2" r="$3" t="$WORK/$1-test"
+  mkdir -p "$t"
+  cat >"$t/t.cpp" <<'EOF'
+#include <cstdio>
+#include <stdexcept>
+#include <string>
+#include <vector>
+int main() {
+  std::vector<std::string> v{"a", "b"};
+  try { throw std::runtime_error(v[0] + v[1]); }
+  catch (const std::exception &e) { std::printf("%s\n", e.what()); }
+  return 0;
+}
+EOF
+  "$CLANG" --target="$triple" -nostdlibinc -nostdinc++ \
+    -isystem "$r/include/c++/v1" -idirafter "$r/msvc/crt/include" \
+    -idirafter "$r/msvc/sdk/include/ucrt" -idirafter "$r/msvc/sdk/include/um" \
+    -idirafter "$r/msvc/sdk/include/shared" \
+    -D_CRT_STDIO_ISO_WIDE_SPECIFIERS \
+    -fms-runtime-lib=static -fexceptions -fcxx-exceptions -std=c++20 -O1 \
+    -fuse-ld=lld -B"$LLVM_BIN" "$t/t.cpp" -o "$t/t.exe" \
+    -L"$r/lib" -L"$r/msvc/crt/lib/$xa" -L"$r/msvc/sdk/lib/um/$xa" -L"$r/msvc/sdk/lib/ucrt/$xa" \
+    -llibc++ "$r"/compiler-rt/lib/windows/clang_rt.builtins*.lib \
+    || { echo "!! [$triple] validation link failed" >&2; exit 1; }
+  echo "   validated: $(file -b "$t/t.exe" | cut -d, -f1-2)"
+  bash "$ROOT/curate/replay-validate.sh" "$r" "$CLANG" -B"$LLVM_BIN" \
+    || { echo "!! [$triple] SYSROOT.toml replay failed" >&2; exit 1; }
+}
+
+for arch in "${ARCHES[@]}"; do
+  case "$arch" in
+    x86_64|amd64|x64) arch=x86_64;  xa=x86_64 ;;
+    aarch64|arm64)    arch=aarch64; xa=aarch64 ;;
+    i686|i386|x86)    arch=i686;    xa=x86 ;;
+    *) echo "!! unknown arch $arch (x86_64, aarch64/arm64, i686/i386)" >&2; exit 1 ;;
+  esac
+  triple="$arch-pc-windows-msvc"
+  name="$arch-windows-msvc"
+  dst="$STAGE/$name"
+  "$CLANG" --target="$triple" -dM -E -x c /dev/null | grep __SIZEOF_FLOAT128__ >/dev/null \
+    || { echo "!! fork clang has no __float128 on $triple (patch its MSVC TargetInfo first)" >&2; exit 1; }
+  echo ">> [$name] staging from $XWIN -> $dst"
+  rm -rf "$dst"; mkdir -p "$dst" "$WORK"
+  stage_msvc "$xa" "$dst"
+  build_runtimes "$triple" "$xa" "$dst"
+  emit_toml "$name" "$xa" "$dst/SYSROOT.toml"
+  validate "$triple" "$xa" "$dst"
+  echo ">> [$name] staged ($(du -sh "$dst" | cut -f1); msvc/ is local only)"
+done
+echo "msvc staging complete (tar-dist.sh ships only the non-msvc/ layer)."
+
+
+==== curate/musl.sh === 
+
+#!/usr/bin/env bash
+# Curate the 5 linux-musl sysroots into canonical staging/<triple>/{include,lib}
+# and write SYSROOT.toml. Tarballs are produced by tar-dist.sh, not here.
+#
+# Canonical mapping (musl-dev + linux-headers + libc++ + libunwind, all static):
+#   usr/include/*  -> include/   (C headers, kernel headers asm|asm-generic|linux,
+#                                  libc++ headers under c++/v1)
+#   usr/lib/*      -> lib/       (.a archives + crt1/crti/crtn/Scrt1/rcrt1 objects)
+#
+# compiler-rt lives in the sysroot (resource_dir = "compiler-rt"):
+#   compiler-rt/lib/<arch>-unknown-linux-musl/{clang_rt.crtbegin.o,clang_rt.crtend.o}
+#     copied from fetch-musl-compiler-rt.sh's staging/compiler-rt-musl
+#   .../libclang_rt.builtins.a
+#     Alpine's, as a placeholder; build-builtins.sh then replaces it with one
+#     built from Kairo's LLVM (f128, i128, bf16). Order: fetch-musl-libcxx.sh,
+#     fetch-musl-compiler-rt.sh, musl.sh, build-builtins.sh.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+STAGE="$ROOT/staging"
+
+TRIPLES=(
+  x86_64-linux-musl
+  aarch64-linux-musl
+  armv7-linux-musl
+  i686-linux-musl
+  riscv64-linux-musl
+)
+
+emit_toml() {
+  local triple="$1" out="$2"
+  cat >"$out" <<EOF
+triple        = "$triple"
+llvm_version  = "22.1.0"
+family        = "linux-musl"
+sysroot       = "."
+include_dirs  = ["include/c++/v1", "include"]
+lib_dirs      = ["lib"]
+has_libcxx    = true
+static        = true
+crt_startup   = ["crt1.o", "crti.o"]
+crt_end       = ["crtn.o"]
+libc_link     = ["-lc"]
+libcxx_link   = ["-lc++", "-lc++abi", "-lunwind"]
+rtlib         = "compiler-rt"
+unwindlib     = "libunwind"
+linker        = "lld"
+resource_dir  = "compiler-rt"
+cc_isolation  = ["-nostdlibinc", "-nostdinc++"]
+EOF
+}
+
+for triple in "${TRIPLES[@]}"; do
+  src="$ROOT/extract/$triple"
+  dst="$STAGE/$triple"
+  echo ">> [$triple] staging"
+
+  test -f "$src/usr/include/c++/v1/vector" \
+    || { echo "!! [$triple] libc++ headers missing; run fetch-musl-libcxx.sh first" >&2; exit 1; }
+
+  rm -rf "$dst"
+  mkdir -p "$dst/include" "$dst/lib"
+
+  # cp -a preserves the dangling libc.so symlink (static target, harmless) and
+  # all archive perms/timestamps.
+  cp -a "$src/usr/include/." "$dst/include/"
+  cp -a "$src/usr/lib/."     "$dst/lib/"
+
+  emit_toml "$triple" "$dst/SYSROOT.toml"
+
+  rt_src="$ROOT/staging/compiler-rt-musl/lib/clang/22/lib/${triple%%-*}-unknown-linux-musl"
+  test -f "$rt_src/clang_rt.crtbegin.o" \
+    || { echo "!! [$triple] no $rt_src; run fetch-musl-compiler-rt.sh first" >&2; exit 1; }
+  mkdir -p "$dst/compiler-rt/lib/${triple%%-*}-unknown-linux-musl"
+  cp -a "$rt_src"/. "$dst/compiler-rt/lib/${triple%%-*}-unknown-linux-musl/"
+
+  # sanity
+  test -f "$dst/include/c++/v1/vector" || { echo "!! [$triple] no libc++ in staging" >&2; exit 1; }
+  test -f "$dst/lib/libc.a"            || { echo "!! [$triple] no libc.a in staging" >&2; exit 1; }
+  test -f "$dst/lib/crt1.o"            || { echo "!! [$triple] no crt1.o in staging" >&2; exit 1; }
+  echo ">> [$triple] staged -> $dst"
+done
+
+echo "musl staging complete."
+
+
+==== curate/netbsd.sh === 
+
+#!/usr/bin/env bash
+# Curate the NetBSD sysroot (x86_64 only). Same structure-preserving approach as
+# FreeBSD (keep usr/include + usr/lib + lib so relative symlinks resolve).
+# NetBSD startup object is crt0.o (not crt1.o). This writes a C-only
+# SYSROOT.toml; build-bsd-runtimes.sh then adds LLVM 22 libc++ (base NetBSD
+# has only GCC's libstdc++) and compiler-rt builtins (base libgcc is GCC's,
+# without f16/bf16), and rewrites the TOML.
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+STAGE="$ROOT/staging"
+triple="x86_64-unknown-netbsd"
+src="$ROOT/extract/$triple"
+dst="$STAGE/$triple"
+
+echo ">> [$triple] staging (preserving usr/lib + lib split)"
+test -f "$src/usr/lib/crt0.o" || { echo "!! no crt0.o" >&2; exit 1; }
+rm -rf "$dst"; mkdir -p "$dst/usr"
+cp -a "$src/usr/include" "$dst/usr/include"
+cp -a "$src/usr/lib"     "$dst/usr/lib"
+cp -a "$src/lib"         "$dst/lib"
+
+cat >"$dst/SYSROOT.toml" <<EOF
+triple        = "$triple"
+llvm_version  = "22.1.0"
+family        = "netbsd"
+sysroot       = "."
+include_dirs  = ["usr/include"]
+lib_dirs      = ["usr/lib", "lib"]
+has_libcxx    = false
+static        = false
+crt_startup   = ["crt0.o", "crti.o"]
+crt_end       = ["crtn.o"]
+libc_link     = ["-lc"]
+libcxx_link   = []
+linker        = "lld"
+cc_isolation  = ["-nostdlibinc"]
+EOF
+
+test -f "$dst/usr/include/stdio.h" || { echo "!! no stdio.h" >&2; exit 1; }
+test -f "$dst/usr/lib/libc.a"      || { echo "!! no libc.a" >&2; exit 1; }
+echo ">> [$triple] staged -> $dst"
+
+
+==== curate/replay-validate.sh === 
+
+#!/usr/bin/env bash
+# Prove a curated sysroot works by replaying ONLY its SYSROOT.toml.
+# Parses the TOML, reconstructs the clang invocation, compiles+links a real C++
+# program, and (when host==target) runs it.
+#
+# Usage: replay-validate.sh <root-dir-containing-SYSROOT.toml> [clang]
+set -euo pipefail
+
+ROOT="$1"
+CLANG="${2:-clang}"
+shift $(( $# >= 2 ? 2 : 1 ))
+EXTRA=("$@")   # optional passthrough clang flags (e.g. -resource-dir=... for cross builtins)
+TOML="$ROOT/SYSROOT.toml"
+test -f "$TOML" || { echo "no SYSROOT.toml in $ROOT" >&2; exit 1; }
+
+# minimal TOML reader for the flat keys / string-arrays we emit
+# tolerant of missing keys (no match -> empty, exit 0) under set -e/pipefail
+val()  { { grep -E "^$1[[:space:]]*=" "$TOML" || true; } | head -1 | sed -E 's/^[^=]+=[[:space:]]*//; s/^"//; s/"$//'; }
+arr()  { { grep -E "^$1[[:space:]]*=" "$TOML" || true; } | head -1 | sed -E 's/^[^=]+=[[:space:]]*\[//; s/\]$//; s/"//g; s/,/ /g'; }
+
+triple=$(val triple)
+has_libcxx=$(val has_libcxx)
+static=$(val static)
+rtlib=$(val rtlib)
+unwindlib=$(val unwindlib)
+linker=$(val linker)
+
+family=$(val family)
+inc_flags=()
+for d in $(arr include_dirs); do
+  # windows-msvc: the CRT/SDK dirs go after clang's resource headers, as Kairo
+  # and clang-cl (-imsvc) order them; the UCRT's stddef.h would hide clang's.
+  if [[ "$family" == "windows-msvc" && "$d" != */c++/* ]]; then inc_flags+=(-idirafter "$ROOT/$d")
+  else inc_flags+=(-isystem "$ROOT/$d"); fi
+done
+for d in $(arr cc_defines); do inc_flags+=(-D"$d"); done
+lib_flags=();  for d in $(arr lib_dirs);     do lib_flags+=(-L"$ROOT/$d"); done
+iso_flags=();  for f in $(arr cc_isolation); do iso_flags+=("$f"); done
+xcflags=();    for f in $(arr extra_cflags); do xcflags+=("$f"); done
+# windows-msvc lists lld-link inputs (libc++.lib); the clang driver spells
+# those -llibc++, which it turns back into libc++.lib on the search path.
+lnk() { if [[ "$1" == *.lib ]]; then echo "-l${1%.lib}"; else echo "$1"; fi; }
+cxx_libs=();   for l in $(arr libcxx_link);  do cxx_libs+=("$(lnk "$l")"); done
+c_libs=();     for l in $(arr libc_link);    do c_libs+=("$(lnk "$l")"); done
+
+cmd=("$CLANG" --target="$triple" --sysroot="$ROOT")
+if [[ "$family" == "windows-msvc" ]]; then
+  # static means the static CRT (libcmt); the clang MSVC driver has no -static.
+  # C++ exceptions are off by default on this target.
+  [[ "$static" == "true" ]] && cmd+=(-fms-runtime-lib=static)
+  cmd+=(-fexceptions -fcxx-exceptions)
+  # Builtins come from the sysroot's resource_dir, as Kairo's COFF flavor
+  # finds them; the driver's -rtlib would look in the compiler's instead.
+  rd=$(val resource_dir)
+  for a in "$ROOT/$rd"/lib/windows/clang_rt.builtins-*.lib "$ROOT/$rd"/lib/*-windows-msvc/clang_rt.builtins.lib; do
+    [[ -f "$a" ]] && EXTRA+=(-Wl,"$a")
+  done
+  rtlib=""
+else
+  [[ "$static" == "true" ]] && cmd+=(-static)
+fi
+[[ -n "$rtlib"     ]] && cmd+=(-rtlib="$rtlib")
+[[ -n "$unwindlib" ]] && cmd+=(-unwindlib="$unwindlib")
+[[ -n "$linker"    ]] && cmd+=(-fuse-ld="$linker")
+cmd+=("${iso_flags[@]}" "${xcflags[@]}" "${inc_flags[@]}" "${EXTRA[@]}")
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+out="$tmp/a.out"
+
+if [[ "$has_libcxx" == "true" ]]; then
+  cat >"$tmp/t.cpp" <<'CPP'
+#include <string>
+#include <vector>
+#include <stdexcept>
+int main(){
+  try{
+    std::vector<std::string> v;
+    v.push_back("hello-libcxx");
+    throw std::runtime_error(v[0]);
+  }catch(const std::exception&e){
+    return (int)std::string(e.what()).size();
+  }
+  return -1;
+}
+CPP
+  src="$tmp/t.cpp"; expect=12; libs=("${cxx_libs[@]}")
+else
+  cat >"$tmp/t.c" <<'C'
+#include <stdio.h>
+#include <string.h>
+int main(){ char b[16]; strcpy(b,"hello-c"); return (int)strlen(b); }
+C
+  src="$tmp/t.c"; expect=7; libs=("${c_libs[@]}")
+fi
+
+echo ">> [$triple] building from SYSROOT.toml with: $CLANG"
+"${cmd[@]}" "$src" -o "$out" "${lib_flags[@]}" "${libs[@]}"
+echo ">> [$triple] link OK"
+file "$out" | sed 's/^/   /'
+
+# run native linux binaries whose arch matches the host; run wasi via node.
+host_arch=$(uname -m)
+tri_arch="${triple%%-*}"
+runnable=0
+[[ "$family" == "linux-musl" && "$tri_arch" == "$host_arch" ]] && runnable=1
+
+run_wasi=0
+if [[ "$family" == "wasi" ]] && command -v node >/dev/null 2>&1; then run_wasi=1; fi
+
+if [[ "$runnable" == 1 ]]; then
+  set +e; "$out"; rc=$?; set -e
+  if [[ "$rc" == "$expect" ]]; then
+    echo ">> [$triple] RAN OK (exit=$rc == expected $expect)"
+  else
+    echo "!! [$triple] RAN but exit=$rc != expected $expect" >&2; exit 1
+  fi
+elif [[ "$run_wasi" == 1 ]]; then
+  cat >"$tmp/run.mjs" <<'MJS'
+import { readFile } from 'node:fs/promises';
+import { WASI } from 'node:wasi';
+const wasi = new WASI({ version: 'preview1', args: process.argv.slice(2) });
+const bytes = await readFile(process.argv[2]);
+const mod = await WebAssembly.compile(bytes);
+const inst = await WebAssembly.instantiate(mod, wasi.getImportObject());
+process.exit(wasi.start(inst));
+MJS
+  set +e; node --experimental-wasm-exnref "$tmp/run.mjs" "$out"; rc=$?; set -e
+  if [[ "$rc" == "$expect" ]]; then
+    echo ">> [$triple] RAN OK via node (exit=$rc == expected $expect)"
+  else
+    echo "!! [$triple] RAN via node but exit=$rc != expected $expect" >&2; exit 1
+  fi
+else
+  echo ">> [$triple] link-only (cross-arch, not run on $host_arch host)"
+fi
+
+
+==== curate/tar-dist.sh === 
+
+#!/usr/bin/env bash
+# Pack staging/<triple> -> dist/<triple>-llvm22.tar.xz with the tarball root dir
+# being <triple>/ (so Kairo unpacks to cache/<triple>/). Symlinks preserved
+# (tar stores them verbatim; never dereferenced).
+#
+# A SYSROOT.toml with redistributable = false is skipped (an error when named
+# explicitly); dirs it lists in local_only are excluded from the tarball.
+#
+# Usage: tar-dist.sh <triple> [<triple> ...]   (default: all in staging/)
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+STAGE="$ROOT/staging"; DIST="$ROOT/dist"
+mkdir -p "$DIST"
+
+triples=("$@"); explicit=("$@")
+[[ ${#triples[@]} -eq 0 ]] && mapfile -t triples < <(cd "$STAGE" && ls -d */ | tr -d /)
+
+for triple in "${triples[@]}"; do
+  test -d "$STAGE/$triple" || { echo "!! no staging/$triple" >&2; exit 1; }
+  toml="$STAGE/$triple/SYSROOT.toml"
+  test -f "$toml" || { echo "!! no SYSROOT.toml in $triple" >&2; exit 1; }
+  # License guard. redistributable = false (darwin: Apple SDK) never packs;
+  # local_only dirs (windows-msvc: msvc/, the Microsoft CRT + SDK) are left
+  # out, so only our own layer ships. Enforced here, not by convention.
+  if grep -qE '^redistributable[[:space:]]*=[[:space:]]*false' "$toml"; then
+    echo "!! $triple is redistributable = false (vendor SDK license); not packing" >&2
+    [[ ${#explicit[@]} -gt 0 ]] && exit 1 || continue
+  fi
+  local_only=$(grep -E '^local_only[[:space:]]*=' "$toml" | grep -oE '"[^"]+"' | tr -d '"' || true)
+  excludes=()
+  for d in $local_only; do excludes+=(--exclude="$triple/$d"); done
+  # Every tarball, whatever curated it: a compressed debug section anywhere
+  # makes the sysroot unlinkable by an lld built without zlib.
+  "$ROOT/curate/decompress-debug.sh" "$triple"
+  out="$DIST/$triple-llvm22.tar.xz"
+  echo ">> packing $triple -> $out"
+  # Deterministic-ish: sort names, zero owner. -h is NOT passed so symlinks stay links.
+  tar --sort=name --owner=0 --group=0 --numeric-owner "${excludes[@]}" \
+      -cJf "$out" -C "$STAGE" "$triple"
+  for d in $local_only; do
+    # no grep -q: exiting at the first match would SIGPIPE tar, and pipefail
+    # would then report "no leak" for exactly the case this check is for
+    if tar -tJf "$out" | grep "^$triple/$d/" >/dev/null; then
+      rm -f "$out"; echo "!! $triple/$d leaked into the tarball; removed $out" >&2; exit 1
+    fi
+  done
+  echo "   $(du -h "$out" | cut -f1)  $(tar -tJf "$out" | wc -l) entries"
+done
+
+
+==== curate/wasi.sh === 
+
+#!/usr/bin/env bash
+# Curate the wasm32-wasi sysroot from wasi-sdk-33 (LLVM 22.1.0, git 4434dabb6991 -
+# the EXACT commit the Kairo fork clang-22 is built from, so libc++ ABI matches).
+#
+# Structure is preserved (NOT flattened): wasi ships per-target subtrees and an
+# eh/noeh libc++ split. We keep include/wasm32-wasi (with its eh/c++/v1 libc++
+# headers) and lib/wasm32-wasi (with its eh/ libc++ archives) at the same depth so
+# the validated isystem/-L paths below resolve directly.
+#
+# We use the EH (exception-enabled) libc++ variant, linked with -fwasm-exceptions
+# (the wasm exception-handling proposal -> exnref). Running requires a runtime that
+# supports it (node --experimental-wasm-exnref); link-only otherwise.
+#
+# compiler-rt builtins are built afterwards by build-wasi-builtins.sh into
+# compiler-rt/lib/wasm32-unknown-wasi/ (resource_dir).
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+STAGE="$ROOT/staging"
+triple="wasm32-wasi"
+src="$ROOT/extract/wasm32-wasi/wasi-sysroot-33.0+m"
+dst="$STAGE/$triple"
+
+echo ">> [$triple] staging (preserving wasm32-wasi + eh/ libc++ split)"
+test -f "$src/lib/wasm32-wasi/crt1-command.o" || { echo "!! no crt1-command.o" >&2; exit 1; }
+test -f "$src/include/wasm32-wasi/eh/c++/v1/vector" || { echo "!! no eh libc++ headers" >&2; exit 1; }
+
+rm -rf "$dst"; mkdir -p "$dst/include" "$dst/lib"
+cp -a "$src/include/wasm32-wasi" "$dst/include/wasm32-wasi"
+cp -a "$src/lib/wasm32-wasi"     "$dst/lib/wasm32-wasi"
+
+cat >"$dst/SYSROOT.toml" <<EOF
+triple        = "$triple"
+llvm_version  = "22.1.0"
+family        = "wasi"
+sysroot       = "."
+include_dirs  = ["include/wasm32-wasi/eh/c++/v1", "include/wasm32-wasi"]
+lib_dirs      = ["lib/wasm32-wasi/eh", "lib/wasm32-wasi"]
+has_libcxx    = true
+static        = false
+crt_startup   = ["crt1-command.o"]
+crt_end       = []
+libc_link     = ["-lc"]
+libcxx_link   = ["-lc++", "-lc++abi", "-lunwind"]
+extra_cflags  = ["-fwasm-exceptions"]
+cc_isolation  = ["-nostdlibinc", "-nostdinc++"]
+rtlib         = "compiler-rt"
+resource_dir  = "compiler-rt"
+EOF
+
+test -f "$dst/lib/wasm32-wasi/eh/libc++.a"      || { echo "!! no libc++.a in staging" >&2; exit 1; }
+test -f "$dst/include/wasm32-wasi/eh/c++/v1/string" || { echo "!! no libc++ string header" >&2; exit 1; }
+echo ">> [$triple] staged -> $dst"
+
+
+==== curate/link-templates/compiler-rt-musl.recipe.md === 
+
+# musl compiler-rt (resolves the fork-build gap, 2026-06-01)
+
+The Kairo fork clang-22 resource dir lacks per-target compiler-rt, so cross-arch
+musl links failed with `cannot open crtend.o`. Fixed by sourcing Alpine's prebuilt
+`compiler-rt-22.1.3-r0` (LLVM 22.1.x, ABI-compatible) for all 5 arches.
+
+## What ships (per arch, the ONLY 3 files a link needs)
+
+    lib/clang/22/lib/<effective-triple>/
+        libclang_rt.builtins.a    # compiler builtins (__udivti3, etc.)
+        clang_rt.crtbegin.o       # C++ static init/teardown frame
+        clang_rt.crtend.o
+
+Effective triples (from `clang --target=<t> -print-effective-triple`):
+x86_64/aarch64/armv7/i686/riscv64-unknown-linux-musl. The sanitizer/xray/profile
+archives in the apk are dropped not needed to link.
+
+## This is the COMPILER's resource dir, NOT a sysroot
+Kairo unpacks `compiler-rt-musl-llvm22.tar.xz` into its clang install
+(`<clang>/lib/clang/22/...`), then links with `-resource-dir` pointing there (or
+it's the default resource dir). The sysroot tarballs stay unchanged.
+
+## Validated
+All 5 musl targets link clean with `-resource-dir=<bundle>/lib/clang/22`:
+x86_64 RUNS (exit 12); aarch64/armv7/riscv64/i686 link-only here (cross-arch,
+no qemu) each produces a correct static ELF for its arch.
+
+Provenance: see DOWNLOADS.md `[musl compiler-rt]`. Staged by
+`curate/fetch-musl-compiler-rt.sh`. Note the i686 apk's internal dir is
+`i586-alpine-linux-musl`; armv7's is `armv7-alpine-linux-musleabihf` (builtins
+suffix `-armhf`).
+
+
+==== curate/link-templates/freebsd.recipe.md === 
+
+# freebsd link recipe (validated x86_64 + aarch64, 2026-10-08)
+
+FreeBSD 14.4 base (libc, crt objects, headers), plus LLVM 22 libc++,
+libc++abi, libunwind and compiler-rt builtins built from Kairo's LLVM by
+`build-bsd-runtimes.sh`, all linked statically. Pipeline: `freebsd.sh` ->
+`build-bsd-runtimes.sh` -> `tar-dist.sh`.
+
+## Why not the base C++ runtime
+
+FreeBSD 14.4 ships libc++ 19.1.7 on libcxxrt. Kairo's C++ interop builds
+against libc++ 22 on every target. Base `libgcc.a` is compiler-rt 19 and has
+no `__trunctfbf2`. The base `usr/include/c++/v1` (libc++ 19) is left in place
+for C interop with base C++ libraries; ours is in `libcxx/` and comes first.
+
+## Layout (base tree NOT flattened)
+
+    usr/include, usr/lib, lib                 FreeBSD base, as shipped
+    libcxx/include/c++/v1                     libc++ 22 headers
+    libcxx/lib/{libc++,libc++abi,libunwind}.a
+    compiler-rt/lib/freebsd/libclang_rt.builtins-<arch>.a
+
+`usr/include`, `usr/lib` and `lib` keep their depth because FreeBSD's
+`usr/lib` is full of `../../lib/<x>.so.N` relative symlinks.
+
+## Validated (what Kairo produces, `kairo --print-ld-args`)
+
+    ld.lld -m elf_x86_64_fbsd --eh-frame-hdr -static -o out \
+      usr/lib/crt1.o usr/lib/crti.o usr/lib/crtbeginT.o <objs> \
+      -Llibcxx/lib -Lusr/lib -Llib \
+      --start-group -lc++ -lc++abi -lunwind \
+        compiler-rt/lib/freebsd/libclang_rt.builtins-x86_64.a -lm -lthr -lc \
+      --end-group usr/lib/crtend.o usr/lib/crtn.o
+
+`crtbeginT.o`/`crtend.o` are added by Kairo's linker, not listed in the TOML
+(listing them too gives `duplicate symbol: __dso_handle`). Kairo programs
+(test.k, f128/i128/f16/bf16 arithmetic, f128 -> bf16) build and link as static
+FreeBSD 14.4 executables on x86_64 and aarch64. Not run (no FreeBSD host).
+
+## Build notes
+
+- aarch64: LLVM 22's libunwind calls `getauxval()` whenever `<sys/auxv.h>`
+  exists. FreeBSD 14 has only `elf_aux_info()`, so `build-bsd-runtimes.sh`
+  force-includes a `getauxval` shim built on it (libunwind's SME check only).
+- Base crt objects carry zlib-compressed debug sections; `tar-dist.sh`
+  decompresses them (`decompress-debug.sh`) so any lld links them.
+
+
+==== curate/link-templates/linux-gnu.recipe.md === 
+
+# linux-gnu link recipe (validated on all 5 arches, 2026-10-07)
+
+glibc 2.31 (Ubuntu 20.04 focal) linked dynamically; libc++, libc++abi,
+libunwind and compiler-rt built from llvm-project 22.1.0 and linked
+statically. Pipeline: `fetch-glibc.sh` -> `build-glibc-runtimes.sh` ->
+`glibc.sh` -> `tar-dist.sh`.
+
+## Why 2.31
+
+The oldest glibc every target ships with: Ubuntu 18.04 (2.27) has no
+riscv64. libc++ itself supports glibc >= 2.24. Binaries run on any glibc
+>= 2.31; in practice they need less (see below).
+
+## Validated
+
+A C++ program (std::thread, a 64-bit std::atomic, throw/catch through
+libunwind + libc++abi, iostream) compiled with
+
+    clang++ --target=<triple> -nostdlibinc -nostdinc++ \
+      -isystem <root>/include/c++/v1 -isystem <root>/include/<multiarch> \
+      -isystem <root>/include -fPIC -c t.cpp
+
+and linked with the exact argv `kairo --print-ld-args` emits for the sysroot
+(PIE: Scrt1.o crti.o clang_rt.crtbegin.o <objs> -lc++ -lc++abi -lunwind
+builtins -lm -lpthread -ldl -lc builtins clang_rt.crtend.o crtn.o).
+
+| target                 | newest GLIBC_ symbol needed | ran        |
+|------------------------|-----------------------------|------------|
+| x86_64-linux-gnu       | 2.16                        | yes        |
+| i686-linux-gnu         | 2.16                        | yes        |
+| aarch64-linux-gnu      | 2.17                        | no (qemu)  |
+| armv7-linux-gnueabihf  | 2.16                        | no (qemu)  |
+| riscv64-linux-gnu      | 2.27 (riscv64's first glibc)| no (qemu)  |
+
+Kairo programs build and link for all five (2026-10-07, with Kairo's
+driver-derived target flags and the clang __float128 patch): `hello.k`
+through std::io, and a program computing in i128, f128, f16 and bf16 whose
+exit code checks each. Both run correctly on x86_64 and i686.
+
+compiler-rt is built with COMPILER_RT_ENABLE_SOFTWARE_INT128 by Kairo's own
+clang, so the 32-bit sysroots carry the __int128 (__divti3, ...) and
+quad-float (__addtf3, __multf3, ...) routines that i128 and f128 lower to.
+
+## Notes
+- `libc_link` carries -lpthread and -ldl: in 2.31 they are still separate
+  libraries, and libc++ / libunwind use both.
+- libc.so / libm.so are rewritten to bare names; lld resolves a bare name in
+  a linker script through -L.
+- glibc's stub `.so.6` files are only link inputs; the target's own glibc
+  is what runs.
+
+
+==== curate/link-templates/linux-musl.recipe.md === 
+
+# linux-musl link recipe (validated on x86_64-linux-musl, 2026-06-01)
+
+Derived from `clang-22 -###` (fork 22.1.0) against `staging/x86_64-linux-musl`,
+then confirmed by compiling + static-linking + **running** a real C++ program
+(`std::vector<std::string>` + `throw`/`catch std::runtime_error`) exit code
+matched expected `what()` length.
+
+## Validated command (what Kairo must reproduce)
+
+    clang --target=<triple> --sysroot=<root> -static \
+      -nostdlibinc -nostdinc++ \
+      -isystem <root>/include/c++/v1 -isystem <root>/include \
+      -rtlib=compiler-rt -unwindlib=libunwind \
+      t.cpp -o out \
+      -L<root>/lib -lc++ -lc++abi -lunwind
+
+## crt ordering (from -###)
+
+    crt1.o  crti.o  <clang_rt.crtbegin>  <objs>  <libs>  <clang_rt.crtend>  crtn.o
+
+- `crt1.o crti.o` ... `crtn.o`  -> shipped in sysroot `lib/`
+- `clang_rt.crtbegin-<arch>.o` / `clang_rt.crtend-<arch>.o` -> from the
+  compiler's compiler-rt **resource dir**, NOT the sysroot (hence absent from
+  crt_startup / crt_end).
+
+## Notes
+- The driver does NOT auto-add `-lc++ -lc++abi`; they must be explicit
+  (captured in `libcxx_link`).
+- Unwinder is `-l:libunwind.a` (llvm-libunwind static), not libgcc_eh.
+- Builtins are compiler-rt (`-rtlib=compiler-rt`), not libgcc.
+- `-nostdlibinc` keeps compiler builtin headers (stddef.h etc.) but drops host
+  system headers; `-nostdinc++` drops the host libc++ (which is glibc-built and
+  fails with "unknown rune table" against musl).
+
+
+==== curate/link-templates/netbsd.recipe.md === 
+
+# netbsd link recipe (validated x86_64, 2026-10-08)
+
+NetBSD 10.1 base (libc, crt objects, headers), plus LLVM 22 libc++,
+libc++abi, libunwind and compiler-rt builtins built from Kairo's LLVM by
+`build-bsd-runtimes.sh`, all linked statically. Pipeline: `netbsd.sh` ->
+`build-bsd-runtimes.sh` -> `tar-dist.sh`.
+
+## Why not the base C++ runtime
+
+NetBSD's base toolchain is GCC 10: it ships libstdc++ and libsupc++, no
+libc++. Its `libgcc.a` is GCC's and has no f16 or bf16 routines.
+
+## Layout
+
+Same as FreeBSD: base `usr/include`, `usr/lib`, `lib` at their depth (relative
+`.so` symlinks), plus `libcxx/` and `compiler-rt/lib/netbsd/`.
+
+## Validated
+
+Startup is `crt0.o crti.o`, then `crtbeginT.o` (added by Kairo's linker for
+-static) ... `crtend.o crtn.o`. Libraries: `-lc++ -lc++abi -lunwind
+<builtins> -lm -lpthread -lc` in one group. Kairo programs (test.k,
+f128/i128/f16/bf16 arithmetic, f128 -> bf16) build and link as static NetBSD
+10.1 executables. Not run (no NetBSD host).
+
+
+==== curate/link-templates/wasi.recipe.md === 
+
+# wasi link recipe (validated wasm32-wasi, RAN via node, 2026-06-01)
+
+From wasi-sdk-33 (LLVM 22.1.0, git 4434dabb6991 the EXACT commit the Kairo fork
+clang-22 is built from, so libc++ ABI matches). The C++ test compiled, linked via
+wasm-ld, and RAN under `node --experimental-wasm-exnref` returning exit 12.
+
+## Validated command (what Kairo must reproduce)
+
+    clang --target=wasm32-wasi --sysroot=<root> \
+      -fwasm-exceptions -nostdlibinc -nostdinc++ \
+      -isystem <root>/include/wasm32-wasi/eh/c++/v1 \
+      -isystem <root>/include/wasm32-wasi \
+      t.cpp -o out.wasm \
+      -L<root>/lib/wasm32-wasi/eh -L<root>/lib/wasm32-wasi \
+      -lc++ -lc++abi -lunwind
+
+## Layout + variants
+- wasi ships an EH / noEH libc++ split. We use the **eh** (exception-enabled)
+  variant: headers in `include/wasm32-wasi/eh/c++/v1`, archives in
+  `lib/wasm32-wasi/eh`. Requires `-fwasm-exceptions` (captured in extra_cflags).
+- crt: `crt1-command.o` (from sysroot lib/wasm32-wasi); no crtn/end.
+- Linker is wasm-ld (driver auto-selects; no `linker` field needed).
+- compiler-rt **builtins** come from the compiler resource dir
+  (`lib/wasm32-unknown-wasi/libclang_rt.builtins.a`), NOT the sysroot.
+
+## Notes
+- `--target=wasm32-wasi` warns deprecated (favors wasm32-wasip1) but links+runs.
+  Asset/triple kept as wasm32-wasi to match sysroot dir names; Kairo can remap.
+- Running needs an exnref-capable runtime (the wasm exception-handling proposal).
+  node >= 24 with `--experimental-wasm-exnref`. Link-only otherwise.
+
+
+==== curate/link-templates/windows-gnu.recipe.md === 
+
+# windows-gnu (llvm-mingw) link recipe (validated all 4 arches, 2026-06-01)
+
+Derived from llvm-mingw-20260224 (UCRT). Validated by compiling + linking the
+real C++ test (`std::vector<std::string>` + throw/catch) to a PE executable for
+x86_64 / aarch64 / armv7 / i686, each link-clean with the bundled compiler-rt.
+
+## Validated command (what Kairo must reproduce)
+
+    clang --target=<triple> --sysroot=<root> \
+      -nostdlibinc -nostdinc++ \
+      -isystem <root>/include/c++/v1 -isystem <root>/include \
+      -rtlib=compiler-rt -unwindlib=libunwind -fuse-ld=lld \
+      t.cpp -o out.exe \
+      -L<root>/lib -lc++ -lunwind \
+      <driver-supplied system libs>
+
+## crt + libs
+
+- crt: `crt2.o crtbegin.o` ... `crtend.o` these ARE shipped in the sysroot
+  `lib/` (unlike musl). Captured in crt_startup / crt_end.
+- compiler-rt **builtins** still come from the compiler resource dir
+  (`lib/clang/22/lib/windows/libclang_rt.builtins-<arch>.a`), NOT the per-arch
+  sysroot same model as musl.
+- libc chain (driver-assembled, captured in libc_link): `-lmingw32 -lmoldname
+  -lmingwex -lmsvcrt -ladvapi32 -lshell32 -luser32 -lkernel32`.
+
+## Notes
+- `libc++.dll.a` bundles libc++abi, so link `-lc++` ONLY adding `-lc++abi`
+  causes multiple-definition errors. Unwind is separate: `-lunwind` required.
+- The driver ignores `-stdlib=libc++`; libc++/unwind must be explicit.
+- `-fuse-ld=lld` required (host GNU ld is x86-only / wrong-format on cross arches).
+
+
+==== curate/link-templates/windows-msvc.recipe.md === 
+
+# windows-msvc link recipe (validated on all 3 arches, 2026-10-08)
+
+Microsoft CRT 14.44.17.14 + Windows SDK 10.0.26100 (from an xwin splat),
+static CRT (/MT), with libc++ and compiler-rt builtins built from
+llvm-project 22.1.0 against it. Pipeline: `xwin splat` (run by the user,
+who accepts Microsoft's license) -> `msvc.sh` -> `tar-dist.sh` (ships only
+our layer).
+
+Arches: x86_64, aarch64 (Microsoft's "ARM64"), i686 (Microsoft's "x86").
+32-bit ARM is not built: Microsoft's tooling for it is deprecated.
+
+## Layout
+
+    <root>/SYSROOT.toml
+    <root>/include/c++/v1/                        ours: libc++ headers
+    <root>/lib/libc++.lib                         ours: static libc++ (vcruntime ABI)
+    <root>/compiler-rt/lib/windows/clang_rt.builtins-<arch>.lib   ours
+    <root>/msvc/crt/{include,lib/<xa>}            Microsoft: local only
+    <root>/msvc/sdk/include/{ucrt,um,shared,winrt}
+    <root>/msvc/sdk/lib/{um,ucrt}/<xa>            Microsoft: local only
+
+`<xa>` is xwin's arch name: `x86_64`, `aarch64`, `x86`. `msvc/` is listed in
+`local_only`. `tar-dist.sh` excludes it and fails if any of it slips into the
+tarball, so a published asset holds only our layer (about 1.4 MB). To use a
+published tarball, the user drops their own xwin splat into `<root>/msvc/`.
+
+## Validated
+
+A C++ program (std::vector<std::string>, throw/catch via vcruntime) built
+with the GNU-style driver from the sysroot alone:
+
+    clang --target=<arch>-pc-windows-msvc -nostdlibinc -nostdinc++ \
+      -isystem   <root>/include/c++/v1 \
+      -idirafter <root>/msvc/crt/include -idirafter <root>/msvc/sdk/include/ucrt \
+      -idirafter <root>/msvc/sdk/include/um -idirafter <root>/msvc/sdk/include/shared \
+      -D_CRT_STDIO_ISO_WIDE_SPECIFIERS \
+      -fms-runtime-lib=static -fexceptions -fcxx-exceptions -fuse-ld=lld \
+      t.cpp -o t.exe \
+      -L<root>/lib -L<root>/msvc/crt/lib/<xa> \
+      -L<root>/msvc/sdk/lib/um/<xa> -L<root>/msvc/sdk/lib/ucrt/<xa> \
+      -llibc++ <root>/compiler-rt/lib/windows/clang_rt.builtins-<arch>.lib
+
+`replay-validate.sh <root>` reproduces this from SYSROOT.toml, and `msvc.sh`
+runs both for every arch. Output: PE32+ x86-64 / PE32+ ARM64 / PE32 i386. The
+x86_64 binary imports only KERNEL32.dll, so it needs no VC++ redistributable.
+None of the binaries were run (no wine on the build host).
+
+## Rules a consumer must follow
+
+- **Header order**: libc++, then clang's resource headers, then the CRT/SDK
+  dirs. The UCRT's `stddef.h` has no `max_align_t`, and if it is searched
+  before clang's it hides the one libc++ needs. clang-cl gets this order
+  from `-imsvc`. Kairo's C interop already orders `include_dirs` this way
+  (`/c++/` dirs, resource dir, the rest).
+- **`_CRT_STDIO_ISO_WIDE_SPECIFIERS`** (TOML `cc_defines`): libc++'s CMake
+  compiles it with this define, and the UCRT stamps every object with
+  `/failifmismatch` on it. A TU that includes `<stdio.h>` without the define
+  fails the link:
+  `lld-link: error: /failifmismatch: mismatch detected for '_CRT_STDIO_ISO_WIDE_SPECIFIERS'`.
+- **MS language mode**: the CRT/SDK headers need `-fms-extensions
+  -fms-compatibility` (for `#pragma pack(push)`, `__declspec`, `__unaligned`).
+  The clang driver adds these for an msvc triple. A cc1-direct consumer must
+  add them itself.
+- `libc_link` / `libcxx_link` are lld-link inputs (`libcmt.lib`), which is how
+  Kairo's COFF flavor passes them. Through the clang driver, spell them
+  `-llibcmt`.
+- `static = true` means the static CRT (`-fms-runtime-lib=static`), not
+  `-static`.
+- No libc++abi and no libunwind: exceptions and RTTI come from vcruntime, and
+  unwinding is SEH.
+
+## Known gaps
+
+- **f128 / i128 / f16 / bf16** are supported (2026-10-08, after the fork's
+  MSVC `__float128` patch). A C program doing arithmetic in all four links on
+  all three arches with no undefined symbols. `msvc.sh` refuses to stage
+  without `__float128` and checks that the builtins define `__addtf3`. On
+  i686, `-fforce-enable-int128` has to reach clang-cl as `-Xclang
+  -fforce-enable-int128`, because clang-cl ignores the plain spelling and the
+  int128/TF routines then compile empty.
+- **Kairo (2026-10-08)**: `kairo --target x86_64-windows-msvc` finds this
+  sysroot, but its cc1 line leaves out the MS language-mode flags
+  (ClangBackend.k `_driver_target_args`), and `Lib/std/io.k` imports
+  `unistd.h`. Both have to change in kairo-lang before Kairo programs build
+  for this target.
+
+
+==== curate/link-templates/x86_64-linux-musl.c.txt === 
+
+ "/usr/bin/ld" "--sysroot=staging/x86_64-linux-musl" "--hash-style=gnu" "--eh-frame-hdr" "-m" "elf_x86_64" "-static" "-o" "a.out" "staging/x86_64-linux-musl/lib/crt1.o" "staging/x86_64-linux-musl/lib/crti.o" "crtbeginT.o" "-Lstaging/x86_64-linux-musl/lib" "/tmp/t-d9a740.o" "--start-group" "-lgcc" "-lgcc_eh" "-lc" "--end-group" "crtend.o" "staging/x86_64-linux-musl/lib/crtn.o"
+
+
+==== curate/link-templates/x86_64-linux-musl.cpp.txt === 
+
+ "/usr/bin/ld" "--sysroot=staging/x86_64-linux-musl" "--hash-style=gnu" "--eh-frame-hdr" "-m" "elf_x86_64" "-static" "-o" "a.out" "staging/x86_64-linux-musl/lib/crt1.o" "staging/x86_64-linux-musl/lib/crti.o" "crtbeginT.o" "-Lstaging/x86_64-linux-musl/lib" "/tmp/t-7bb842.o" "--start-group" "-lgcc" "-lgcc_eh" "-lc" "--end-group" "crtend.o" "staging/x86_64-linux-musl/lib/crtn.o"
